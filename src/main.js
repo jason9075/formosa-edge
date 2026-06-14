@@ -98,8 +98,12 @@ const gridUniforms = {
 };
 
 // ── State ────────────────────────────────────────────────────────────────────────
-/** @type {THREE.Mesh|null} */
-let terrainMesh = null;
+/** @type {THREE.Mesh[]} */
+let terrainMeshes = [];
+/** @type {THREE.Group|null} */
+let terrainGroup = null;
+/** @type {THREE.MeshStandardMaterial|null} */
+let terrainMat = null;
 /** @type {THREE.Box3|null} */
 let terrainBBox = null;
 /** @type {Record<string,number>} */
@@ -204,10 +208,10 @@ function toNDC(e) {
 }
 
 canvas.addEventListener('dblclick', (e) => {
-  if (!terrainMesh) return;
+  if (terrainMeshes.length === 0) return;
   toNDC(e);
   raycaster.setFromCamera(mouse, camera);
-  const hits = raycaster.intersectObject(terrainMesh);
+  const hits = raycaster.intersectObjects(terrainMeshes);
   if (hits.length > 0) {
     controls.target.copy(hits[0].point);
     controls.update();
@@ -215,10 +219,10 @@ canvas.addEventListener('dblclick', (e) => {
 });
 
 canvas.addEventListener('mousemove', (e) => {
-  if (!terrainMesh) return;
+  if (terrainMeshes.length === 0) return;
   toNDC(e);
   raycaster.setFromCamera(mouse, camera);
-  const hits = raycaster.intersectObject(terrainMesh);
+  const hits = raycaster.intersectObjects(terrainMeshes);
   if (hits.length > 0) {
     const { x, y, z } = hits[0].point;
     const glbZScale = glbMeta.z_scale ?? 1;
@@ -245,31 +249,37 @@ setTimeout(() => { opHint.style.opacity = '0'; }, 5000);
 opHint.addEventListener('click', nudgeHint);
 
 // ── Vertex colour application ────────────────────────────────────────────────────
-function applyVertexColors(mesh, mapName) {
-  const pos   = mesh.geometry.attributes.position;
-  const count = pos.count;
-  const buf   = new Float32Array(count * 3);
-
+// Pass 1: find global Y range across all chunks so the colour scale is consistent.
+// Pass 2: write per-vertex colour into each chunk geometry.
+function applyVertexColors(meshes, mapName) {
   let yMin = Infinity, yMax = -Infinity;
-  for (let i = 0; i < count; i++) {
-    const y = pos.getY(i);
-    if (y < yMin) yMin = y;
-    if (y > yMax) yMax = y;
+  for (const mesh of meshes) {
+    const pos = mesh.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const y = pos.getY(i);
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
   }
 
   const fn    = COLOR_MAPS[mapName] ?? COLOR_MAPS.terrain;
   const range = (yMax - yMin) || 1;
-  for (let i = 0; i < count; i++) {
-    const t    = (pos.getY(i) - yMin) / range;
-    const [r, g, b] = fn(Math.max(0, Math.min(1, t)));
-    buf[i * 3]     = r;
-    buf[i * 3 + 1] = g;
-    buf[i * 3 + 2] = b;
+
+  for (const mesh of meshes) {
+    const pos = mesh.geometry.attributes.position;
+    const buf = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      const t = (pos.getY(i) - yMin) / range;
+      const [r, g, b] = fn(Math.max(0, Math.min(1, t)));
+      buf[i * 3] = r; buf[i * 3 + 1] = g; buf[i * 3 + 2] = b;
+    }
+    mesh.geometry.setAttribute('color', new THREE.BufferAttribute(buf, 3));
   }
 
-  mesh.geometry.setAttribute('color', new THREE.BufferAttribute(buf, 3));
-  mesh.material.vertexColors = true;
-  mesh.material.needsUpdate  = true;
+  if (terrainMat) {
+    terrainMat.vertexColors = true;
+    terrainMat.needsUpdate  = true;
+  }
 
   const glbZScale = glbMeta.z_scale ?? 1;
   legendMin.textContent = `${Math.round(yMin / glbZScale)} m`;
@@ -292,11 +302,11 @@ function rebuildLegendBar(mapName) {
 zScaleSlider.addEventListener('input', () => {
   userZScale = parseFloat(zScaleSlider.value);
   zScaleValue.textContent = `${userZScale.toFixed(1)}×`;
-  if (terrainMesh) terrainMesh.scale.y = userZScale;
+  if (terrainGroup) terrainGroup.scale.y = userZScale;
 });
 
 wireframeToggle.addEventListener('change', () => {
-  if (terrainMesh) terrainMesh.material.wireframe = wireframeToggle.checked;
+  if (terrainMat) { terrainMat.wireframe = wireframeToggle.checked; terrainMat.needsUpdate = true; }
 });
 
 gridToggle.addEventListener('change', () => {
@@ -310,7 +320,7 @@ gridSpacingSelect.addEventListener('change', () => {
 
 colorMapSelect.addEventListener('change', () => {
   currentColorMap = colorMapSelect.value;
-  if (terrainMesh) applyVertexColors(terrainMesh, currentColorMap);
+  if (terrainMeshes.length > 0) applyVertexColors(terrainMeshes, currentColorMap);
 });
 
 // ── LOD levels (altitude thresholds in GLB Y-units = metres at z_scale=1) ────────
@@ -340,7 +350,7 @@ function targetLodUrl() {
 }
 
 async function switchLod(url) {
-  if (lodPending || url === activeLodUrl || !terrainMesh) return;
+  if (lodPending || url === activeLodUrl || !terrainGroup) return;
   lodPending = true;
 
   const lvl = LOD_LEVELS.find(l => l.url === url);
@@ -370,10 +380,12 @@ async function switchLod(url) {
       lodCache.set(url, geom);
     }
 
-    terrainMesh.geometry = geom;
-    applyVertexColors(terrainMesh, currentColorMap);
-    geom.computeBoundingBox();
-    terrainBBox = geom.boundingBox.clone();
+    const oldGroup = terrainGroup;
+    buildTerrainGroup(geom);
+    terrainGroup.scale.y = userZScale;
+    scene.remove(oldGroup);
+    scene.add(terrainGroup);
+    applyVertexColors(terrainMeshes, currentColorMap);
 
     activeLodUrl = url;
     setLodBadge(lvl?.label ?? url, false);
@@ -384,6 +396,79 @@ async function switchLod(url) {
   } finally {
     lodPending = false;
   }
+}
+
+// ── Terrain chunking ─────────────────────────────────────────────────────────────
+// Split a single BufferGeometry into CHUNK_R × CHUNK_C sub-meshes so Three.js
+// frustum culling can discard off-screen chunks individually.
+const CHUNK_R = 8;
+const CHUNK_C = 8;
+
+/**
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {(THREE.BufferGeometry|null)[]}
+ */
+function chunkGeometry(geometry) {
+  const pos = geometry.attributes.position;
+  const nor = geometry.attributes.normal;
+  const idxArr = geometry.index.array;
+
+  geometry.computeBoundingBox();
+  const bbox = geometry.boundingBox;
+  const W = (bbox.max.x - bbox.min.x) || 1;
+  const D = (bbox.max.z - bbox.min.z) || 1;
+  const cW = W / CHUNK_C;
+  const cD = D / CHUNK_R;
+
+  // Assign each triangle to a chunk bucket by centroid
+  const buckets = Array.from({ length: CHUNK_R * CHUNK_C }, () => /** @type {number[]} */ ([]));
+  for (let t = 0; t < idxArr.length; t += 3) {
+    const i0 = idxArr[t], i1 = idxArr[t + 1], i2 = idxArr[t + 2];
+    const cx = (pos.getX(i0) + pos.getX(i1) + pos.getX(i2)) / 3;
+    const cz = (pos.getZ(i0) + pos.getZ(i1) + pos.getZ(i2)) / 3;
+    const ci = Math.min(Math.floor((cx - bbox.min.x) / cW), CHUNK_C - 1);
+    const ri = Math.min(Math.floor((cz - bbox.min.z) / cD), CHUNK_R - 1);
+    buckets[ri * CHUNK_C + ci].push(i0, i1, i2);
+  }
+
+  return buckets.map((triIdx) => {
+    if (triIdx.length === 0) return null;
+    const unique = [...new Set(triIdx)];
+    const vertMap = new Map(unique.map((v, i) => [v, i]));
+    const n = unique.length;
+    const newPos = new Float32Array(n * 3);
+    const newNor = new Float32Array(n * 3);
+    unique.forEach((ov, ni) => {
+      newPos[ni*3]   = pos.getX(ov); newPos[ni*3+1] = pos.getY(ov); newPos[ni*3+2] = pos.getZ(ov);
+      newNor[ni*3]   = nor.getX(ov); newNor[ni*3+1] = nor.getY(ov); newNor[ni*3+2] = nor.getZ(ov);
+    });
+    const newIdx = new Uint32Array(triIdx.length);
+    triIdx.forEach((ov, i) => { newIdx[i] = vertMap.get(ov); });
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
+    g.setAttribute('normal',   new THREE.BufferAttribute(newNor, 3));
+    g.setIndex(new THREE.BufferAttribute(newIdx, 1));
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+    return g;
+  });
+}
+
+/** Rebuild terrainGroup / terrainMeshes from a (possibly new) geometry. */
+function buildTerrainGroup(geometry) {
+  const chunks = chunkGeometry(geometry);
+  const group  = new THREE.Group();
+  const meshes = [];
+  for (const cg of chunks) {
+    if (!cg) continue;
+    const m = new THREE.Mesh(cg, terrainMat);
+    group.add(m);
+    meshes.push(m);
+  }
+  terrainGroup  = group;
+  terrainMeshes = meshes;
+  terrainBBox   = new THREE.Box3();
+  for (const m of meshes) terrainBBox.union(m.geometry.boundingBox);
 }
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
@@ -405,16 +490,17 @@ const loader = new GLTFLoader();
         glbMeta.y_center ?? 0
       );
 
+      let firstMesh = null;
       gltf.scene.traverse((node) => {
-        if (node.isMesh && !terrainMesh) terrainMesh = node;
+        if (node.isMesh && !firstMesh) firstMesh = node;
       });
 
-      if (!terrainMesh) {
+      if (!firstMesh) {
         loadingDetail.textContent = 'Error: no mesh found in GLB.';
         return;
       }
 
-      const mat = new THREE.MeshStandardMaterial({
+      terrainMat = new THREE.MeshStandardMaterial({
         roughness: 0.85,
         metalness: 0.0,
         side: THREE.FrontSide,
@@ -423,7 +509,7 @@ const loader = new GLTFLoader();
       // Inject TWD97 grid overlay into the standard material's fragment shader.
       // Grid lines are computed from world-space XZ, which maps 1:1 to TWD97 metres
       // (GLB X = E - xCenter, GLB Z = -(N - yCenter)), so we undo the offset in-shader.
-      mat.onBeforeCompile = (shader) => {
+      terrainMat.onBeforeCompile = (shader) => {
         // Pass worldspace position from vertex to fragment
         shader.vertexShader = 'varying vec3 vWorldPos;\n' + shader.vertexShader;
         shader.vertexShader = shader.vertexShader.replace(
@@ -463,19 +549,17 @@ const loader = new GLTFLoader();
       };
 
       // Unique cache key prevents Three.js merging this with an unmodified material
-      mat.customProgramCacheKey = () => 'terrain-grid-v1';
+      terrainMat.customProgramCacheKey = () => 'terrain-grid-v1';
 
-      terrainMesh.material = mat;
-      applyVertexColors(terrainMesh, currentColorMap);
+      // Split into 8×8 chunks; each has its own bounding sphere for frustum culling
+      const fullGeom = firstMesh.geometry;
+      lodCache.set(GLB_URL, fullGeom);
+      buildTerrainGroup(fullGeom);
+      applyVertexColors(terrainMeshes, currentColorMap);
+      if (userZScale !== 1) terrainGroup.scale.y = userZScale;
 
-      terrainMesh.geometry.computeBoundingBox();
-      terrainBBox = terrainMesh.geometry.boundingBox.clone();
-
-      // Seed LOD cache with the initial geometry so the first switchLod is instant
-      lodCache.set(GLB_URL, terrainMesh.geometry);
+      scene.add(terrainGroup);
       setLodBadge('100 m');
-
-      scene.add(gltf.scene);
 
       progressFill.style.width = '100%';
       setTimeout(() => { loadingOverlay.hidden = true; }, 350);
@@ -531,7 +615,7 @@ function tickIntro(t) {
 (function animate(t) {
   requestAnimationFrame(animate);
 
-  if (terrainMesh && !introComplete) {
+  if (terrainGroup && !introComplete) {
     tickIntro(t);
   }
 
