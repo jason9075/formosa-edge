@@ -1,4 +1,20 @@
 raw/
 output/
+public/
 *.zip
+
+# Nix
+result
+result-*
 .direnv/
+
+# Node
+node_modules/
+dist/
+
+# Neovim
+*.swp
+*.swo
+
+# OS
+.DS_Store

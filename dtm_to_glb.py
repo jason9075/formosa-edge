@@ -168,8 +168,11 @@ def build_faces(Z: np.ndarray) -> np.ndarray:
     )
     v00, v10, v01, v11 = v00[valid], v10[valid], v01[valid], v11[valid]
 
-    tri1 = np.stack([v00, v10, v11], axis=-1)
-    tri2 = np.stack([v00, v11, v01], axis=-1)
+    # Winding: CCW when viewed from +Y (above), so face normals point up (+Y).
+    # Verify: for tri1, N.y = (v11-v00).z*(v10-v00).x - (v11-v00).x*(v10-v00).z
+    #         = (-s)(0) - (s)(-s) = +s²  > 0  ✓
+    tri1 = np.stack([v00, v11, v10], axis=-1)
+    tri2 = np.stack([v00, v01, v11], axis=-1)
     return np.concatenate([tri1, tri2], axis=0).astype(np.uint32)
 
 
@@ -221,6 +224,13 @@ def write_glb(
 
     gltf = {
         'asset': {'version': '2.0', 'generator': 'dtm_to_glb'},
+        'extras': {
+            'x_center': round(x_center, 2),
+            'y_center': round(y_center, 2),
+            'z_scale': z_scale,
+            'crs': 'EPSG:3826',
+            'vertical_datum': 'TWVD2001',
+        },
         'scene': 0,
         'scenes': [{'nodes': [0]}],
         'nodes': [{'mesh': 0, 'name': 'terrain'}],

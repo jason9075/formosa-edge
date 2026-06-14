@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DTM Visualizer &mdash; Taipei</title>
+  <script type="module" src="/src/main.js"></script>
+</head>
+<body>
+  <!-- Top bar -->
+  <header id="top-bar">
+    <span id="app-title">DTM Visualizer &mdash; Taipei</span>
+    <button id="panel-toggle" type="button" aria-label="Toggle control panel" aria-expanded="true">☰</button>
+  </header>
+
+  <!-- Full-screen canvas (rendered below all overlays) -->
+  <canvas id="canvas"></canvas>
+
+  <!-- Control panel: fixed right overlay, collapsible -->
+  <aside id="control-panel" data-open="1" aria-label="Controls">
+
+    <section class="panel-section">
+      <h3 class="section-title">Camera</h3>
+      <div class="btn-row">
+        <button id="reset-camera" type="button" title="R">Reset</button>
+        <button id="top-view"    type="button" title="T">Top</button>
+        <button id="side-view"   type="button">Side</button>
+      </div>
+    </section>
+
+    <section class="panel-section">
+      <h3 class="section-title">Terrain</h3>
+      <label class="slider-label">
+        <span>Z-Scale <b id="z-scale-value">1.0&times;</b></span>
+        <input id="z-scale" type="range" min="0.5" max="5" step="0.1" value="1" />
+      </label>
+      <label class="check-label">
+        <input id="wireframe-toggle" type="checkbox" />
+        Wireframe
+      </label>
+      <label class="check-label">
+        <input id="grid-toggle" type="checkbox" />
+        TWD97 Grid
+      </label>
+      <label class="select-label" id="grid-spacing-row" hidden>
+        Spacing
+        <select id="grid-spacing">
+          <option value="1000">1 km</option>
+          <option value="2000">2 km</option>
+          <option value="5000" selected>5 km</option>
+          <option value="10000">10 km</option>
+        </select>
+      </label>
+      <label class="select-label">
+        Quality
+        <select id="quality-select">
+          <option value="100" selected>100 m &mdash; Preview (~3 MB)</option>
+          <option value="40">40 m &mdash; Mid (~18 MB)</option>
+          <option value="20">20 m &mdash; Full (~65 MB)</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="panel-section">
+      <h3 class="section-title">Color Map</h3>
+      <select id="color-map">
+        <option value="terrain">Terrain</option>
+        <option value="grayscale">Grayscale</option>
+        <option value="rainbow">Rainbow</option>
+      </select>
+    </section>
+
+    <section class="panel-section">
+      <h3 class="section-title">Layers <span class="chip">Soon</span></h3>
+      <p class="hint-text">Contour lines, satellite overlay — coming soon.</p>
+    </section>
+
+  </aside>
+
+  <!-- Bottom bar: coordinates | legend | operation hint -->
+  <footer id="bottom-bar">
+    <div id="coord-hud" class="hud-cell">E: &mdash; &nbsp; N: &mdash; &nbsp; &#9650; &mdash;</div>
+    <div id="legend-cell" class="hud-cell">
+      <span id="legend-min" class="legend-label">&mdash; m</span>
+      <div id="legend-bar"></div>
+      <span id="legend-max" class="legend-label">&mdash; m</span>
+    </div>
+    <div id="operation-hint" class="hud-cell hint-cell">
+      Left-drag Orbit &nbsp;|&nbsp; Right-drag Pan &nbsp;|&nbsp; Scroll Zoom
+    </div>
+  </footer>
+
+  <!-- Loading overlay -->
+  <div id="loading-overlay">
+    <div id="loading-inner">
+      <div id="loading-title">Loading terrain mesh&hellip;</div>
+      <div id="progress-track"><div id="progress-fill"></div></div>
+      <div id="loading-detail">Connecting&hellip;</div>
+    </div>
+  </div>
+
+  <!-- Math modal (💡) -->
+  <div id="math-modal" role="dialog" aria-modal="true" aria-labelledby="math-title" hidden>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h2 id="math-title">Math Behind the Scene</h2>
+        <div class="modal-actions">
+          <button id="language-toggle" type="button">Eng / &#20013;</button>
+          <button id="close-math" type="button" aria-label="Close modal">&#10005;</button>
+        </div>
+      </div>
+      <div id="math-content" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Fixed 💡 button -->
+  <button id="open-math" class="fab" type="button"
+    aria-label="Explain the math" aria-haspopup="dialog">&#128161;</button>
+</body>
+</html>
