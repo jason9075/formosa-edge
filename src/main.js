@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader }    from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader }   from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import renderMathInElement from 'katex/dist/contrib/auto-render';
 import 'katex/dist/katex.min.css';
@@ -493,7 +494,7 @@ async function switchLod(url) {
     let geom = lodCache.get(url);
     if (!geom) {
       geom = await new Promise((resolve, reject) => {
-        new GLTFLoader().load(
+        loader.load(
           url,
           (gltf) => {
             let m = null;
@@ -816,7 +817,10 @@ hillshadeToggle.addEventListener('change', () => {
 
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath(import.meta.env.BASE_URL + 'draco/');
 const loader = new GLTFLoader();
+loader.setDRACOLoader(dracoLoader);
 
 (function loadTerrain() {
   loadingOverlay.hidden = false;

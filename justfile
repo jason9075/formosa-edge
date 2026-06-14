@@ -20,6 +20,24 @@ convert-fast:
 convert-100m:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_100m.glb --step 5
 
+# Draco-compress all GLBs in output/ in-place (level 7 — good balance of size vs decode speed)
+# Run after any convert-* target. Requires node_modules (just install).
+compress-glb:
+    @[ -d node_modules ] || npm install --ignore-scripts
+    @for glb in output/taipei_100m.glb output/taipei_40m.glb output/taipei_20m.glb; do \
+        [ -f "$$glb" ] || continue; \
+        echo "Compressing $$glb …"; \
+        node node_modules/.bin/gltf-pipeline -i "$$glb" -o "$$glb" --draco.compressionLevel 7; \
+    done
+
+# Copy Draco decoder WASM from three.js to public/draco/ (commit alongside code)
+stage-draco:
+    mkdir -p public/draco
+    cp node_modules/three/examples/jsm/libs/draco/draco_decoder.wasm public/draco/
+    cp node_modules/three/examples/jsm/libs/draco/draco_wasm_wrapper.js public/draco/
+    cp node_modules/three/examples/jsm/libs/draco/draco_decoder.js public/draco/
+    @echo "Draco decoder staged to public/draco/"
+
 # Extract road centrelines from shapefile → output/roads.json
 convert-roads:
     python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taipei_100m.glb output/roads.json
@@ -54,12 +72,15 @@ clean:
 install:
     npm install --ignore-scripts
 
-# Copy output GLBs to public/ for Vite production builds
+# Copy output GLBs + JSON overlays to public/ for Vite production builds
 # (Dev mode serves output/ directly via vite.config.js middleware — no need to stage first)
 stage:
     mkdir -p public
     @for glb in output/*.glb; do \
         [ -f "$$glb" ] && cp "$$glb" "public/$$(basename $$glb)" && echo "Staged $$glb"; \
+    done || true
+    @for json in output/*.json; do \
+        [ -f "$$json" ] && cp "$$json" "public/$$(basename $$json)" && echo "Staged $$json"; \
     done || true
 
 # Start Vite dev server on :8080

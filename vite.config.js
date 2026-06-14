@@ -33,7 +33,7 @@ function serveOutputPlugin() {
 }
 
 export default defineConfig({
-  base: process.env.NODE_ENV === 'production' ? '/gfx-lab/' : '/',
+  base: process.env.NODE_ENV === 'production' ? '/DTM-Visualizer/' : '/',
   plugins: [serveOutputPlugin()],
   server: { port: 8080 },
   build: { outDir: 'dist' },
