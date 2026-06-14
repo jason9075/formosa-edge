@@ -22,7 +22,7 @@ const gridToggle       = /** @type {HTMLInputElement}  */ (document.getElementBy
 const gridSpacingRow   = document.getElementById('grid-spacing-row');
 const gridSpacingSelect = /** @type {HTMLSelectElement} */ (document.getElementById('grid-spacing'));
 const colorMapSelect   = /** @type {HTMLSelectElement} */ (document.getElementById('color-map'));
-const qualitySelect    = /** @type {HTMLSelectElement} */ (document.getElementById('quality-select'));
+const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
 const legendMax       = document.getElementById('legend-max');
@@ -112,6 +112,13 @@ let hintTimer = null;
 let introStartTime = /** @type {number|null} */ (null);
 let introComplete = false;
 const INTRO_MS = 3000;
+
+// LOD state
+/** @type {Map<string, THREE.BufferGeometry>} */
+const lodCache = new Map();
+let activeLodUrl = '/taipei_100m.glb';
+let lodPending = false;
+let lodFrameCount = 0;
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
 function setPanelOpen(open) {
@@ -306,19 +313,78 @@ colorMapSelect.addEventListener('change', () => {
   if (terrainMesh) applyVertexColors(terrainMesh, currentColorMap);
 });
 
-qualitySelect.addEventListener('change', () => {
-  const url = new URL(window.location.href);
-  url.searchParams.set('q', qualitySelect.value);
-  window.location.href = url.toString();
-});
+// ── LOD levels (altitude thresholds in GLB Y-units = metres at z_scale=1) ────────
+// camera.position.y − terrainBBox.min.y gives height above lowest terrain point.
+//   > 8000 m above terrain → 100 m mesh (wide overview)
+//   3000–8000 m            → 40 m mesh  (regional zoom)
+//   < 3000 m               → 20 m mesh  (detail zoom)
+const LOD_LEVELS = [
+  { url: '/taipei_20m.glb',  label: '20 m',  maxAlt: 3000     },
+  { url: '/taipei_40m.glb',  label: '40 m',  maxAlt: 8000     },
+  { url: '/taipei_100m.glb', label: '100 m', maxAlt: Infinity },
+];
+const GLB_URL = '/taipei_100m.glb';
 
-// ── Determine GLB URL from ?q= param ────────────────────────────────────────────
-const urlQ  = new URLSearchParams(window.location.search).get('q') ?? '100';
-const GLB_URL = urlQ === '20'  ? '/taipei_20m.glb'
-              : urlQ === '40'  ? '/taipei_40m.glb'
-              : urlQ === '100' ? '/taipei_100m.glb'
-              :                  '/taipei_100m.glb';
-qualitySelect.value = ['20', '40', '100'].includes(urlQ) ? urlQ : '100';
+function setLodBadge(text, loading = false) {
+  lodBadge.textContent = text;
+  lodBadge.dataset.loading = loading ? '1' : '0';
+}
+
+function targetLodUrl() {
+  if (!terrainBBox) return '/taipei_100m.glb';
+  const alt = camera.position.y - terrainBBox.min.y;
+  for (const lvl of LOD_LEVELS) {
+    if (alt <= lvl.maxAlt) return lvl.url;
+  }
+  return '/taipei_100m.glb';
+}
+
+async function switchLod(url) {
+  if (lodPending || url === activeLodUrl || !terrainMesh) return;
+  lodPending = true;
+
+  const lvl = LOD_LEVELS.find(l => l.url === url);
+  setLodBadge(`↑ ${lvl?.label}…`, true);
+
+  try {
+    let geom = lodCache.get(url);
+    if (!geom) {
+      geom = await new Promise((resolve, reject) => {
+        new GLTFLoader().load(
+          url,
+          (gltf) => {
+            let m = null;
+            gltf.scene.traverse(n => { if (n.isMesh && !m) m = n; });
+            if (!m) { reject(new Error('no mesh in ' + url)); return; }
+            const extras = gltf.parser.json?.extras ?? {};
+            if (extras.x_center) {
+              glbMeta = extras;
+              gridUniforms.uGridOffset.value.set(extras.x_center, extras.y_center ?? 0);
+            }
+            resolve(m.geometry);
+          },
+          undefined,
+          reject,
+        );
+      });
+      lodCache.set(url, geom);
+    }
+
+    terrainMesh.geometry = geom;
+    applyVertexColors(terrainMesh, currentColorMap);
+    geom.computeBoundingBox();
+    terrainBBox = geom.boundingBox.clone();
+
+    activeLodUrl = url;
+    setLodBadge(lvl?.label ?? url, false);
+  } catch (err) {
+    console.warn('LOD switch failed:', err);
+    const cur = LOD_LEVELS.find(l => l.url === activeLodUrl);
+    setLodBadge(cur?.label ?? '?', false);
+  } finally {
+    lodPending = false;
+  }
+}
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
 const loader = new GLTFLoader();
@@ -405,6 +471,10 @@ const loader = new GLTFLoader();
       terrainMesh.geometry.computeBoundingBox();
       terrainBBox = terrainMesh.geometry.boundingBox.clone();
 
+      // Seed LOD cache with the initial geometry so the first switchLod is instant
+      lodCache.set(GLB_URL, terrainMesh.geometry);
+      setLodBadge('100 m');
+
       scene.add(gltf.scene);
 
       progressFill.style.width = '100%';
@@ -422,7 +492,7 @@ const loader = new GLTFLoader();
     (err) => {
       console.error('GLB load failed:', err);
       progressFill.style.background = '#e74c3c';
-      loadingDetail.textContent = `Cannot load ${GLB_URL} — run: just convert-fast`;
+      loadingDetail.textContent = `Cannot load ${GLB_URL} — run: just convert-100m`;
     }
   );
 }());
@@ -466,6 +536,13 @@ function tickIntro(t) {
   }
 
   controls.update();
+
+  // LOD check once per ~60 frames; skip during intro orbit to avoid racing the first load
+  if (++lodFrameCount % 60 === 0 && terrainBBox && introComplete) {
+    const target = targetLodUrl();
+    if (target !== activeLodUrl) switchLod(target);
+  }
+
   renderer.render(scene, camera);
 }(0));
 

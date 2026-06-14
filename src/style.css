@@ -255,6 +255,30 @@ input[type="range"]::-moz-range-thumb {
   line-height: 1.5;
 }
 
+.lod-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+#lod-badge {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  color: var(--accent);
+  background: rgba(79, 195, 247, 0.10);
+  border: 1px solid rgba(79, 195, 247, 0.25);
+  border-radius: 4px;
+  padding: 2px 7px;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+#lod-badge[data-loading="1"] {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
 /* ── Bottom bar ────────────────────────────────────────────────── */
 #bottom-bar {
   position: fixed;
