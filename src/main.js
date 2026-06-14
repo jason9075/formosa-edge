@@ -23,6 +23,7 @@ const gridSpacingRow   = document.getElementById('grid-spacing-row');
 const gridSpacingSelect = /** @type {HTMLSelectElement} */ (document.getElementById('grid-spacing'));
 const colorMapSelect   = /** @type {HTMLSelectElement} */ (document.getElementById('color-map'));
 const boundariesToggle = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
+const hillshadeToggle  = /** @type {HTMLInputElement} */ (document.getElementById('hillshade-toggle'));
 const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
@@ -88,6 +89,48 @@ const COLOR_MAPS = {
     const b = Math.max(0, Math.min(1, 1.5 - Math.abs(t * 4 - 1)));
     return [r, g, b];
   },
+  // t = 0 (flat 0°) → 1 (vertical cliff 90°)
+  slope: (t) => {
+    const stops = [
+      [0.00, 1.00, 1.00, 1.00],
+      [0.25, 0.75, 0.95, 0.45],
+      [0.55, 0.95, 0.78, 0.10],
+      [0.80, 0.90, 0.30, 0.05],
+      [1.00, 0.70, 0.05, 0.05],
+    ];
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const f = (t - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+        return [
+          stops[i-1][1] + (stops[i][1] - stops[i-1][1]) * f,
+          stops[i-1][2] + (stops[i][2] - stops[i-1][2]) * f,
+          stops[i-1][3] + (stops[i][3] - stops[i-1][3]) * f,
+        ];
+      }
+    }
+    return [0.70, 0.05, 0.05];
+  },
+  // t = 0/1 (North) → 0.25 (East) → 0.5 (South) → 0.75 (West) → back to North
+  aspect: (t) => {
+    const stops = [
+      [0.00, 0.20, 0.40, 0.80],
+      [0.25, 0.95, 0.85, 0.15],
+      [0.50, 0.85, 0.15, 0.15],
+      [0.75, 0.15, 0.70, 0.30],
+      [1.00, 0.20, 0.40, 0.80],
+    ];
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const f = (t - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+        return [
+          stops[i-1][1] + (stops[i][1] - stops[i-1][1]) * f,
+          stops[i-1][2] + (stops[i][2] - stops[i-1][2]) * f,
+          stops[i-1][3] + (stops[i][3] - stops[i-1][3]) * f,
+        ];
+      }
+    }
+    return [0.20, 0.40, 0.80];
+  },
 };
 
 // ── TWD97 Grid shader uniforms ───────────────────────────────────────────────────
@@ -97,6 +140,16 @@ const gridUniforms = {
   uGridOpacity: { value: 0.0 },              // 0 = hidden
   uGridOffset:  { value: new THREE.Vector2(0, 0) },  // (x_center, y_center) from GLB extras
 };
+
+// ── Sun / hillshade uniforms ─────────────────────────────────────────────────────
+// uSunDirView is recomputed each frame from sunDirWorld via camera.matrixWorldInverse
+// so hillshade stays correct as the camera orbits.
+const sunUniforms = {
+  uHillshade:  { value: 0.0 },
+  uSunDirView: { value: new THREE.Vector3() },
+};
+// World-space sun direction; matches dirLight.position by default (NW sun at 45°)
+let sunDirWorld = new THREE.Vector3(-1, 1.2, -1).normalize();
 
 // ── State ────────────────────────────────────────────────────────────────────────
 /** @type {THREE.Mesh[]} */
@@ -262,27 +315,47 @@ setTimeout(() => { opHint.style.opacity = '0'; }, 5000);
 opHint.addEventListener('click', nudgeHint);
 
 // ── Vertex colour application ────────────────────────────────────────────────────
-// Pass 1: find global Y range across all chunks so the colour scale is consistent.
-// Pass 2: write per-vertex colour into each chunk geometry.
+// Elevation maps (terrain/grayscale/rainbow): 2-pass — global yMin/yMax → per-vertex colour.
+// Slope/Aspect: single-pass using the normal attribute (no elevation normalization).
 function applyVertexColors(meshes, mapName) {
+  const isSlope  = mapName === 'slope';
+  const isAspect = mapName === 'aspect';
+
+  // Pass 1: global Y range (elevation-based maps only)
   let yMin = Infinity, yMax = -Infinity;
-  for (const mesh of meshes) {
-    const pos = mesh.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const y = pos.getY(i);
-      if (y < yMin) yMin = y;
-      if (y > yMax) yMax = y;
+  if (!isSlope && !isAspect) {
+    for (const mesh of meshes) {
+      const pos = mesh.geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const y = pos.getY(i);
+        if (y < yMin) yMin = y;
+        if (y > yMax) yMax = y;
+      }
     }
   }
 
   const fn    = COLOR_MAPS[mapName] ?? COLOR_MAPS.terrain;
   const range = (yMax - yMin) || 1;
 
+  // Pass 2: per-vertex colour
   for (const mesh of meshes) {
     const pos = mesh.geometry.attributes.position;
+    const nor = mesh.geometry.attributes.normal;
     const buf = new Float32Array(pos.count * 3);
     for (let i = 0; i < pos.count; i++) {
-      const t = (pos.getY(i) - yMin) / range;
+      let t;
+      if (isSlope) {
+        // slope angle from vertical: acos(normalY) / 90°
+        const ny = Math.max(-1, Math.min(1, nor.getY(i)));
+        t = Math.acos(ny) / (Math.PI / 2);
+      } else if (isAspect) {
+        // compass direction the slope faces: atan2 in XZ plane
+        // N=-Z, E=+X → atan2(nx, -nz): N=0, E=π/2, S=π, W=-π/2
+        const nx = nor.getX(i), nz = nor.getZ(i);
+        t = (Math.atan2(nx, -nz) + Math.PI) / (2 * Math.PI);
+      } else {
+        t = (pos.getY(i) - yMin) / range;
+      }
       const [r, g, b] = fn(Math.max(0, Math.min(1, t)));
       buf[i * 3] = r; buf[i * 3 + 1] = g; buf[i * 3 + 2] = b;
     }
@@ -294,9 +367,17 @@ function applyVertexColors(meshes, mapName) {
     terrainMat.needsUpdate  = true;
   }
 
-  const glbZScale = glbMeta.z_scale ?? 1;
-  legendMin.textContent = `${Math.round(yMin / glbZScale)} m`;
-  legendMax.textContent = `${Math.round(yMax / glbZScale)} m`;
+  if (isSlope) {
+    legendMin.textContent = '0°';
+    legendMax.textContent = '90°';
+  } else if (isAspect) {
+    legendMin.textContent = 'N';
+    legendMax.textContent = 'N ↺';
+  } else {
+    const glbZScale = glbMeta.z_scale ?? 1;
+    legendMin.textContent = `${Math.round(yMin / glbZScale)} m`;
+    legendMax.textContent = `${Math.round(yMax / glbZScale)} m`;
+  }
   rebuildLegendBar(mapName);
 }
 
@@ -486,6 +567,12 @@ function buildTerrainGroup(geometry) {
   for (const m of meshes) terrainBBox.union(m.geometry.boundingBox);
 }
 
+// ── Sun position ─────────────────────────────────────────────────────────────────
+/**
+ * Simplified astronomical sun position for Taiwan (≈25°N, equinox declination).
+ * @param {number} hour - solar time (0–24)
+ * @returns {{ alt: number, az: number, above: boolean }}
+ */
 // ── Admin boundary overlay ───────────────────────────────────────────────────────
 const boundaryMat = new THREE.LineBasicMaterial({
   color: 0xffe566,
@@ -548,6 +635,11 @@ boundariesToggle.addEventListener('change', () => {
   if (boundaryGroup) boundaryGroup.visible = boundariesToggle.checked;
 });
 
+hillshadeToggle.addEventListener('change', () => {
+  sunUniforms.uHillshade.value = hillshadeToggle.checked ? 1.0 : 0.0;
+});
+
+
 // ── Load terrain ─────────────────────────────────────────────────────────────────
 const loader = new GLTFLoader();
 
@@ -594,39 +686,46 @@ const loader = new GLTFLoader();
           '#include <project_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;'
         );
 
-        // Inject grid uniforms + calculation into fragment shader
+        // Inject all custom uniforms into the fragment shader header
         shader.fragmentShader = [
           'varying vec3 vWorldPos;',
           'uniform float uGridSpacing;',
           'uniform float uGridOpacity;',
           'uniform vec2  uGridOffset;',
+          'uniform float uHillshade;',
+          'uniform vec3  uSunDirView;',
           shader.fragmentShader,
         ].join('\n');
 
-        // Append grid overlay just before the final dithering step
+        // Hillshade → then grid → then dithering
+        // `normal` is the view-space surface normal set by normal_fragment_begin.
+        // `uSunDirView` is sunDirWorld transformed to view space each frame.
         shader.fragmentShader = shader.fragmentShader.replace(
           '#include <dithering_fragment>',
           `{
-  // Reconstruct TWD97 XY from GLB XZ (X=E-xc, Z=-(N-yc))
+  // Hillshade: Lambert factor in view space, multiplied over terrain colour
+  float hs = max(0.0, dot(normal, uSunDirView));
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * max(0.25, hs), uHillshade);
+}
+{
+  // TWD97 grid overlay
   vec2 twd97 = vec2(vWorldPos.x + uGridOffset.x, -vWorldPos.z + uGridOffset.y);
-  // Distance to nearest grid line in each axis
   vec2 gmod = mod(twd97, uGridSpacing);
   float d = min(min(gmod.x, uGridSpacing - gmod.x),
                 min(gmod.y, uGridSpacing - gmod.y));
-  float lineW = uGridSpacing * 0.004;  // line width = 0.4% of spacing
+  float lineW = uGridSpacing * 0.004;
   float ga = (1.0 - smoothstep(0.0, lineW, d)) * uGridOpacity;
-  // White-ish grid line over terrain colour
   gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.95, 0.95, 1.0), ga);
 }
 #include <dithering_fragment>`
         );
 
-        // Bind the shared uniform objects so mutations propagate each frame
-        Object.assign(shader.uniforms, gridUniforms);
+        // Bind all shared uniform objects so mutations propagate each frame
+        Object.assign(shader.uniforms, gridUniforms, sunUniforms);
       };
 
       // Unique cache key prevents Three.js merging this with an unmodified material
-      terrainMat.customProgramCacheKey = () => 'terrain-grid-v1';
+      terrainMat.customProgramCacheKey = () => 'terrain-grid-v2';
 
       // Split into 8×8 chunks; each has its own bounding sphere for frustum culling
       const fullGeom = firstMesh.geometry;
@@ -745,6 +844,12 @@ let lastFrameTime = 0;
   }
 
   tickFlyKeys(dt);
+
+  // Reproject sun world direction to view space each frame (camera may have moved)
+  sunUniforms.uSunDirView.value
+    .copy(sunDirWorld)
+    .transformDirection(camera.matrixWorldInverse);
+
   controls.update();
 
   // LOD check once per ~60 frames; skip during intro orbit to avoid racing the first load
