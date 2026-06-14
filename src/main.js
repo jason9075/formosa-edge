@@ -196,12 +196,19 @@ resetCameraBtn.addEventListener('click', cameraReset);
 topViewBtn.addEventListener('click', cameraTop);
 sideViewBtn.addEventListener('click', cameraSide);
 
+// ── Fly keys ─────────────────────────────────────────────────────────────────────
+const keysDown = new Set();
+
 document.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+  keysDown.add(e.key.toLowerCase());
   if (e.key === 'r' || e.key === 'R') cameraReset();
   if (e.key === 't' || e.key === 'T') cameraTop();
   if (e.key === 'Escape' && !mathModal.hidden) mathModal.hidden = true;
 });
+
+document.addEventListener('keyup',  (e) => keysDown.delete(e.key.toLowerCase()));
+window.addEventListener('blur', () => keysDown.clear());
 
 // ── Raycaster ────────────────────────────────────────────────────────────────────
 const raycaster = new THREE.Raycaster();
@@ -682,14 +689,62 @@ function tickIntro(t) {
   }
 }
 
+// ── WASD / QE fly movement ───────────────────────────────────────────────────────
+// Reuse vectors to avoid GC pressure in the hot path.
+const _fwd   = new THREE.Vector3();
+const _right  = new THREE.Vector3();
+const _flyDelta = new THREE.Vector3();
+const _up     = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Translate both camera and orbit target by WASD / QE input each frame.
+ * Speed scales with camera-to-target distance so movement feels natural at every
+ * zoom level. Shift multiplies speed by 5 for rapid traversal.
+ *
+ * @param {number} dt - seconds since last frame (capped at 50 ms)
+ */
+function tickFlyKeys(dt) {
+  if (!introComplete) return;
+  if (!keysDown.has('w') && !keysDown.has('s') &&
+      !keysDown.has('a') && !keysDown.has('d') &&
+      !keysDown.has('q') && !keysDown.has('e')) return;
+
+  const dist  = camera.position.distanceTo(controls.target);
+  const speed = Math.max(5, dist * 0.5) * dt * (keysDown.has('shift') ? 5 : 1);
+
+  // Forward direction projected onto XZ plane (ignore camera tilt)
+  camera.getWorldDirection(_fwd);
+  _fwd.y = 0;
+  _fwd.normalize();
+
+  _right.crossVectors(_fwd, _up).normalize();
+
+  _flyDelta.set(0, 0, 0);
+  if (keysDown.has('w')) _flyDelta.addScaledVector(_fwd,   speed);
+  if (keysDown.has('s')) _flyDelta.addScaledVector(_fwd,  -speed);
+  if (keysDown.has('a')) _flyDelta.addScaledVector(_right, -speed);
+  if (keysDown.has('d')) _flyDelta.addScaledVector(_right,  speed);
+  if (keysDown.has('q')) _flyDelta.y -= speed;
+  if (keysDown.has('e')) _flyDelta.y += speed;
+
+  camera.position.add(_flyDelta);
+  controls.target.add(_flyDelta);
+}
+
 // ── Render loop ──────────────────────────────────────────────────────────────────
+let lastFrameTime = 0;
+
 (function animate(t) {
   requestAnimationFrame(animate);
+
+  const dt = Math.min((t - lastFrameTime) / 1000, 0.05);
+  lastFrameTime = t;
 
   if (terrainGroup && !introComplete) {
     tickIntro(t);
   }
 
+  tickFlyKeys(dt);
   controls.update();
 
   // LOD check once per ~60 frames; skip during intro orbit to avoid racing the first load

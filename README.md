@@ -209,6 +209,10 @@ just dev
 | Right-drag / Middle-drag | Pan |
 | Scroll | Zoom |
 | Double-click terrain | Set new orbit target |
+| `W` / `S` | Fly forward / backward (XZ plane) |
+| `A` / `D` | Strafe left / right |
+| `Q` / `E` | Move down / up (Y axis) |
+| `Shift` + WASD/QE | 5× speed boost |
 | `R` | Reset camera |
 | `T` | Top-down view |
 | `Esc` | Close math modal |
