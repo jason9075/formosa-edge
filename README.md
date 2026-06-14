@@ -13,6 +13,7 @@ a TWD97 coordinate grid overlay, and administrative boundary lines.
 |---------|--------|-----|--------|
 | Taiwan 20 m DTM (2025 edition) | GRD / HDR tiles | TWD97 TM2 (EPSG:3826), TWVD2001 vertical | [data.gov.tw/dataset/176927](https://data.gov.tw/dataset/176927) |
 | Township / district boundaries | Shapefile (polygon) | GCS TWD97 geographic (degrees) | [data.gov.tw/dataset/7441](https://data.gov.tw/dataset/7441) |
+| National / provincial road centrelines (incl. expressways) | Shapefile (polyline) | TWD97 TM2 (EPSG:3826) | [data.gov.tw/dataset/73232](https://data.gov.tw/dataset/73232) |
 
 ---
 
@@ -172,6 +173,45 @@ setting, without requiring per-vertex terrain raycasting.
 
 ---
 
+### 7. Road Overlay (`road_to_json.py`)
+
+The road shapefile is already in TWD97 TM2 (EPSG:3826) — no reprojection is needed.
+
+**Classification by `ROADCLASS1` attribute:**
+
+| Code | Class | Colour |
+|------|-------|--------|
+| `H*` | National freeway | Orange-red |
+| `1E` | Expressway | Light blue |
+| `1U`, `1W` | Provincial road | Teal |
+
+**Pipeline:**
+
+1. Reads polyline geometries with `pyshp`.
+2. Filters segments to the terrain bounding box (+ 1 km margin).
+3. Applies the same XZ mapping as the GLB:
+
+   ```python
+   x = Easting  - x_center
+   z = -(Northing - y_center)
+   ```
+
+4. Emits flat edge-pair arrays per class (`[x0,z0,x1,z1, ...]`), yielding ~40 k edges total.
+5. Writes `output/roads.json` (~1.2 MB).
+
+In Three.js, each class becomes a single `THREE.LineSegments` (one draw call per class).
+Road vertex Y is sampled from a **terrain height grid** built from the 100 m GLB: for each
+vertex the maximum elevation among the four surrounding 100 m grid cells is used, so
+road lines stay above the terrain surface across the full range of Z-Scale settings.
+
+```js
+// world_Y = ROAD_LIFT + userZScale × max_surrounding_elevation
+roadGroup.position.y = ROAD_LIFT;   // constant world offset
+roadGroup.scale.y    = userZScale;  // co-scales with terrain
+```
+
+---
+
 ## Development Setup
 
 This project uses [Nix flakes](https://nixos.wiki/wiki/Flakes) for reproducible environments
@@ -192,11 +232,14 @@ just convert        # 20 m  — ~71 MB, full detail
 # Generate admin boundary JSON (requires output/taipei_100m.glb)
 just convert-boundaries
 
+# Generate road centreline JSON (requires output/taipei_100m.glb)
+just convert-roads
+
 # Start Vite dev server → http://localhost:8080
 just dev
 ```
 
-> **Note:** The dev server middleware serves `output/*.glb` and `output/boundaries.json`
+> **Note:** The dev server middleware serves `output/*.glb` and all `output/*.json` files
 > directly without a separate staging step. For a production build run `just build`.
 
 ---
@@ -225,15 +268,17 @@ just dev
 .
 ├── dtm_to_glb.py        # DTM tiles → GLB mesh (Python)
 ├── shp_to_json.py       # Shapefile boundaries → JSON (Python)
+├── road_to_json.py      # Road centrelines → JSON (Python)
 ├── flake.nix            # Nix dev shell (Node 22, Python 3.13 + numpy/pyshp/pyproj)
 ├── justfile             # Task runner
 ├── vite.config.js       # Vite config + output/ middleware
 ├── index.html           # App shell
 ├── src/
-│   ├── main.js          # Three.js scene, LOD, chunking, shaders, boundaries
+│   ├── main.js          # Three.js scene, LOD, chunking, shaders, overlays
 │   └── style.css        # Dark UI styles
 ├── raw/taipei/          # Source DTM tiles (not committed)
-├── line/                # Shapefile data (not committed)
+├── raw/road/            # Road shapefile (not committed)
+├── line/                # Boundary shapefile (not committed)
 └── output/              # Generated GLB + JSON files (not committed)
 ```
 
@@ -244,3 +289,4 @@ just dev
 Source code: MIT.
 Terrain data: [CC BY 4.0](https://data.gov.tw/dataset/176927) — 國土測繪中心, 內政部.
 Boundary data: [CC BY 4.0](https://data.gov.tw/dataset/7441) — 內政部國土管理署.
+Road data: [CC BY 4.0](https://data.gov.tw/dataset/73232) — 內政部國土管理署.

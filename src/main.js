@@ -22,8 +22,13 @@ const gridToggle       = /** @type {HTMLInputElement}  */ (document.getElementBy
 const gridSpacingRow   = document.getElementById('grid-spacing-row');
 const gridSpacingSelect = /** @type {HTMLSelectElement} */ (document.getElementById('grid-spacing'));
 const colorMapSelect   = /** @type {HTMLSelectElement} */ (document.getElementById('color-map'));
-const boundariesToggle = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
-const hillshadeToggle  = /** @type {HTMLInputElement} */ (document.getElementById('hillshade-toggle'));
+const roadsToggle          = /** @type {HTMLInputElement} */ (document.getElementById('roads-toggle'));
+const roadsSub             = /** @type {HTMLElement} */ (document.getElementById('roads-sub'));
+const roadsHighwayToggle   = /** @type {HTMLInputElement} */ (document.getElementById('roads-highway'));
+const roadsExpresswayToggle= /** @type {HTMLInputElement} */ (document.getElementById('roads-expressway'));
+const roadsProvincialToggle= /** @type {HTMLInputElement} */ (document.getElementById('roads-provincial'));
+const boundariesToggle     = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
+const hillshadeToggle      = /** @type {HTMLInputElement} */ (document.getElementById('hillshade-toggle'));
 const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
@@ -397,6 +402,7 @@ zScaleSlider.addEventListener('input', () => {
   userZScale = parseFloat(zScaleSlider.value);
   zScaleValue.textContent = `${userZScale.toFixed(1)}×`;
   if (terrainGroup) terrainGroup.scale.y = userZScale;
+  updateRoadY();
   updateBoundaryY();
 });
 
@@ -424,8 +430,8 @@ colorMapSelect.addEventListener('change', () => {
 //   3000–8000 m            → 40 m mesh  (regional zoom)
 //   < 3000 m               → 20 m mesh  (detail zoom)
 const LOD_LEVELS = [
-  { url: '/taipei_20m.glb',  label: '20 m',  maxAlt: 3000     },
-  { url: '/taipei_40m.glb',  label: '40 m',  maxAlt: 8000     },
+  { url: '/taipei_20m.glb',  label: '20 m',  maxAlt: 3500     },
+  { url: '/taipei_40m.glb',  label: '40 m',  maxAlt: 7000     },
   { url: '/taipei_100m.glb', label: '100 m', maxAlt: Infinity },
 ];
 const GLB_URL = '/taipei_100m.glb';
@@ -481,6 +487,7 @@ async function switchLod(url) {
     scene.remove(oldGroup);
     scene.add(terrainGroup);
     applyVertexColors(terrainMeshes, currentColorMap);
+    updateRoadY();
     updateBoundaryY();
 
     activeLodUrl = url;
@@ -573,6 +580,136 @@ function buildTerrainGroup(geometry) {
  * @param {number} hour - solar time (0–24)
  * @returns {{ alt: number, az: number, above: boolean }}
  */
+// ── Terrain height grid (for road elevation lookup) ──────────────────────────────
+/** @type {Map<string, number>|null} built once from first terrain load */
+let terrainHeightGrid = null;
+const HEIGHT_SNAP = 100; // metres — matches the coarsest (100 m) GLB grid
+
+function buildTerrainHeightGrid() {
+  terrainHeightGrid = new Map();
+  terrainGroup.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const pos = obj.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const gx = Math.round(pos.getX(i) / HEIGHT_SNAP);
+      const gz = Math.round(pos.getZ(i) / HEIGHT_SNAP);
+      const key = `${gx},${gz}`;
+      const y = pos.getY(i);
+      const cur = terrainHeightGrid.get(key);
+      if (cur === undefined || y > cur) terrainHeightGrid.set(key, y);
+    }
+  });
+}
+
+/**
+ * Nearest-neighbour terrain elevation at any (x, z) in GLB local space.
+ * @param {number} x @param {number} z @returns {number}
+ */
+function sampleTerrainHeight(x, z) {
+  if (!terrainHeightGrid || !terrainBBox) return terrainBBox?.min.y ?? 0;
+  // Take the max of the 4 surrounding grid-cell corners so the road never dips
+  // below the actual terrain between sample points.
+  const gx = x / HEIGHT_SNAP;
+  const gz = z / HEIGHT_SNAP;
+  const x0 = Math.floor(gx), x1 = x0 + 1;
+  const z0 = Math.floor(gz), z1 = z0 + 1;
+  let maxY = terrainBBox.min.y;
+  for (const cx of [x0, x1]) {
+    for (const cz of [z0, z1]) {
+      const y = terrainHeightGrid.get(`${cx},${cz}`);
+      if (y !== undefined && y > maxY) maxY = y;
+    }
+  }
+  return maxY;
+}
+
+// ── Road overlay ─────────────────────────────────────────────────────────────────
+/** @type {THREE.Group|null} */
+let roadGroup = null;
+/** @type {Map<string, THREE.LineSegments>} */
+const roadLayers = new Map();
+// Roads float ROAD_LIFT world-metres above terrain; scale.y tracks userZScale.
+const ROAD_LIFT = 20;
+
+/**
+ * After terrain height grid is ready, bake per-vertex elevation into road buffers.
+ * Vertex local-Y = raw terrain elevation; roadGroup.scale.y = userZScale
+ * → world_Y = ROAD_LIFT + userZScale × elevation, matching the terrain transform.
+ */
+function applyRoadElevations() {
+  if (!terrainHeightGrid || roadLayers.size === 0) return;
+  for (const [, seg] of roadLayers) {
+    const pos = seg.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      pos.setY(i, sampleTerrainHeight(pos.getX(i), pos.getZ(i)));
+    }
+    pos.needsUpdate = true;
+  }
+}
+
+function updateRoadY() {
+  if (!roadGroup) return;
+  roadGroup.position.y = ROAD_LIFT;
+  roadGroup.scale.y = userZScale;
+}
+
+/**
+ * Build a THREE.Group with one LineSegments per road class.
+ * Input arrays are flat XZ edge pairs: [x0,z0, x1,z1, ...] with Y=0.
+ * @param {{ highway: number[], expressway: number[], provincial: number[] }} data
+ * @returns {THREE.Group}
+ */
+function buildRoadGroup(data) {
+  const group = new THREE.Group();
+  roadLayers.clear();
+  const classes = [
+    { key: 'highway',    color: 0xff5522, opacity: 0.95 },
+    { key: 'expressway', color: 0x88bbff, opacity: 0.90 },
+    { key: 'provincial', color: 0x66ccaa, opacity: 0.85 },
+  ];
+  for (const { key, color, opacity } of classes) {
+    const flat = data[key];
+    if (!flat || flat.length < 4) continue;
+    const edgeCount = flat.length / 4;
+    const positions = new Float32Array(edgeCount * 6);
+    for (let i = 0; i < edgeCount; i++) {
+      const fi = i * 4, pi = i * 6;
+      const x0 = flat[fi], z0 = flat[fi+1], x1 = flat[fi+2], z1 = flat[fi+3];
+      positions[pi]   = x0; positions[pi+1] = sampleTerrainHeight(x0, z0); positions[pi+2] = z0;
+      positions[pi+3] = x1; positions[pi+4] = sampleTerrainHeight(x1, z1); positions[pi+5] = z1;
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const seg = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
+    roadLayers.set(key, seg);
+    group.add(seg);
+  }
+  return group;
+}
+
+fetch('/roads.json')
+  .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+  .then((data) => {
+    roadGroup = buildRoadGroup(data);
+    roadGroup.visible = roadsToggle.checked;
+    updateRoadY();
+    scene.add(roadGroup);
+  })
+  .catch(() => { console.info('[roads] Not found — run: just convert-roads'); });
+
+roadsToggle.addEventListener('change', () => {
+  if (roadGroup) roadGroup.visible = roadsToggle.checked;
+  roadsSub.hidden = !roadsToggle.checked;
+});
+/** @param {string} key @param {boolean} v */
+function setRoadLayerVisible(key, v) {
+  const seg = roadLayers.get(key);
+  if (seg) seg.visible = v;
+}
+roadsHighwayToggle.addEventListener('change', () => setRoadLayerVisible('highway', roadsHighwayToggle.checked));
+roadsExpresswayToggle.addEventListener('change', () => setRoadLayerVisible('expressway', roadsExpresswayToggle.checked));
+roadsProvincialToggle.addEventListener('change', () => setRoadLayerVisible('provincial', roadsProvincialToggle.checked));
+
 // ── Admin boundary overlay ───────────────────────────────────────────────────────
 const boundaryMat = new THREE.LineBasicMaterial({
   color: 0xffe566,
@@ -731,10 +868,13 @@ const loader = new GLTFLoader();
       const fullGeom = firstMesh.geometry;
       lodCache.set(GLB_URL, fullGeom);
       buildTerrainGroup(fullGeom);
+      buildTerrainHeightGrid(); // build once from 100m terrain; roads use this for vertex Y
       applyVertexColors(terrainMeshes, currentColorMap);
       if (userZScale !== 1) terrainGroup.scale.y = userZScale;
 
       scene.add(terrainGroup);
+      applyRoadElevations(); // fix vertex Y if roads loaded before terrain
+      updateRoadY();
       updateBoundaryY();
       setLodBadge('100 m');
 

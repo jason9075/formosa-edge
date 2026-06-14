@@ -20,6 +20,10 @@ convert-fast:
 convert-100m:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_100m.glb --step 5
 
+# Extract road centrelines from shapefile → output/roads.json
+convert-roads:
+    python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taipei_100m.glb output/roads.json
+
 # Extract township boundary rings from shapefile → output/boundaries.json
 convert-boundaries:
     python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taipei_100m.glb output/boundaries.json
