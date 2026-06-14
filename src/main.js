@@ -191,7 +191,7 @@ const lodCache = new Map();
  * @type {Map<string, { group: THREE.Group, meshes: THREE.Mesh[], bbox: THREE.Box3, colorMap: string }>}
  */
 const lodGroupCache = new Map();
-let activeLodUrl = '/taipei_100m.glb';
+let activeLodUrl = '';
 let lodPending = false;
 let lodFrameCount = 0;
 
@@ -439,12 +439,13 @@ colorMapSelect.addEventListener('change', () => {
 //   > 8000 m above terrain → 100 m mesh (wide overview)
 //   3000–8000 m            → 40 m mesh  (regional zoom)
 //   < 3000 m               → 20 m mesh  (detail zoom)
+const BASE = import.meta.env.BASE_URL;
 const LOD_LEVELS = [
-  { url: '/taipei_20m.glb',  label: '20 m',  maxAlt: 3500     },
-  { url: '/taipei_40m.glb',  label: '40 m',  maxAlt: 7000     },
-  { url: '/taipei_100m.glb', label: '100 m', maxAlt: Infinity },
+  { url: BASE + 'taipei_20m.glb',  label: '20 m',  maxAlt: 3500     },
+  { url: BASE + 'taipei_40m.glb',  label: '40 m',  maxAlt: 7000     },
+  { url: BASE + 'taipei_100m.glb', label: '100 m', maxAlt: Infinity },
 ];
-const GLB_URL = '/taipei_100m.glb';
+const GLB_URL = BASE + 'taipei_100m.glb';
 
 function setLodBadge(text, loading = false) {
   lodBadge.textContent = text;
@@ -452,12 +453,12 @@ function setLodBadge(text, loading = false) {
 }
 
 function targetLodUrl() {
-  if (!terrainBBox) return '/taipei_100m.glb';
+  if (!terrainBBox) return GLB_URL;
   const alt = camera.position.y - terrainBBox.min.y;
   for (const lvl of LOD_LEVELS) {
     if (alt <= lvl.maxAlt) return lvl.url;
   }
-  return '/taipei_100m.glb';
+  return GLB_URL;
 }
 
 async function switchLod(url) {
@@ -726,7 +727,7 @@ function buildRoadGroup(data) {
   return group;
 }
 
-fetch('/roads.json')
+fetch(BASE + 'roads.json')
   .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
   .then((data) => {
     roadGroup = buildRoadGroup(data);
@@ -792,7 +793,7 @@ function buildBoundaryGroup(rings) {
 
 // Load boundaries.json produced by `just convert-boundaries`.
 // Non-fatal: silently skips if the file doesn't exist yet.
-fetch('/boundaries.json')
+fetch(BASE + 'boundaries.json')
   .then((r) => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
@@ -924,6 +925,7 @@ loader.setDRACOLoader(dracoLoader);
       applyRoadElevations(); // fix vertex Y if roads loaded before terrain
       updateRoadY();
       updateBoundaryY();
+      activeLodUrl = GLB_URL;
       setLodBadge('100 m');
 
       progressFill.style.width = '100%';
