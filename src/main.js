@@ -182,8 +182,14 @@ let boundaryGroup = null;
 const BOUNDARY_LIFT = 50; // metres above terrain max (in geometry Y-space)
 
 // LOD state
-/** @type {Map<string, THREE.BufferGeometry>} */
+/** @type {Map<string, THREE.BufferGeometry>} raw geometry cache (avoids re-fetching) */
 const lodCache = new Map();
+/**
+ * Built-group cache: stores the fully-chunked + vertex-coloured TerrainGroup per URL
+ * so repeated LOD switches are an O(1) scene-graph swap, not a re-chunk.
+ * @type {Map<string, { group: THREE.Group, meshes: THREE.Mesh[], bbox: THREE.Box3, colorMap: string }>}
+ */
+const lodGroupCache = new Map();
 let activeLodUrl = '/taipei_100m.glb';
 let lodPending = false;
 let lodFrameCount = 0;
@@ -422,6 +428,9 @@ gridSpacingSelect.addEventListener('change', () => {
 colorMapSelect.addEventListener('change', () => {
   currentColorMap = colorMapSelect.value;
   if (terrainMeshes.length > 0) applyVertexColors(terrainMeshes, currentColorMap);
+  // Keep the group cache in sync so the active LOD restores correct colors on re-visit
+  const entry = lodGroupCache.get(activeLodUrl);
+  if (entry) entry.colorMap = currentColorMap;
 });
 
 // ── LOD levels (altitude thresholds in GLB Y-units = metres at z_scale=1) ────────
@@ -455,8 +464,31 @@ async function switchLod(url) {
   lodPending = true;
 
   const lvl = LOD_LEVELS.find(l => l.url === url);
-  setLodBadge(`↑ ${lvl?.label}…`, true);
+  const cached = lodGroupCache.get(url);
 
+  // Cached path: scene swap only — no re-chunk, no re-colour (unless map changed)
+  if (cached) {
+    if (cached.colorMap !== currentColorMap) {
+      applyVertexColors(cached.meshes, currentColorMap);
+      cached.colorMap = currentColorMap;
+    }
+    const oldGroup = terrainGroup;
+    terrainGroup  = cached.group;
+    terrainMeshes = cached.meshes;
+    terrainBBox   = cached.bbox;
+    terrainGroup.scale.y = userZScale;
+    scene.remove(oldGroup);
+    scene.add(terrainGroup);
+    updateRoadY();
+    updateBoundaryY();
+    activeLodUrl = url;
+    setLodBadge(lvl?.label ?? url, false);
+    lodPending = false;
+    return;
+  }
+
+  // First visit: fetch → chunk → colour → cache
+  setLodBadge(`↑ ${lvl?.label}…`, true);
   try {
     let geom = lodCache.get(url);
     if (!geom) {
@@ -483,10 +515,16 @@ async function switchLod(url) {
 
     const oldGroup = terrainGroup;
     buildTerrainGroup(geom);
+    applyVertexColors(terrainMeshes, currentColorMap);
+    lodGroupCache.set(url, {
+      group:    terrainGroup,
+      meshes:   terrainMeshes,
+      bbox:     terrainBBox,
+      colorMap: currentColorMap,
+    });
     terrainGroup.scale.y = userZScale;
     scene.remove(oldGroup);
     scene.add(terrainGroup);
-    applyVertexColors(terrainMeshes, currentColorMap);
     updateRoadY();
     updateBoundaryY();
 
@@ -870,6 +908,12 @@ const loader = new GLTFLoader();
       buildTerrainGroup(fullGeom);
       buildTerrainHeightGrid(); // build once from 100m terrain; roads use this for vertex Y
       applyVertexColors(terrainMeshes, currentColorMap);
+      lodGroupCache.set(GLB_URL, {
+        group:    terrainGroup,
+        meshes:   terrainMeshes,
+        bbox:     terrainBBox,
+        colorMap: currentColorMap,
+      });
       if (userZScale !== 1) terrainGroup.scale.y = userZScale;
 
       scene.add(terrainGroup);
