@@ -12,7 +12,7 @@ function serveOutputPlugin() {
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const url = req.url ?? '/';
-        if (!/\.glb$/i.test(url)) return next();
+        if (!/\.(glb|json)$/i.test(url)) return next();
 
         const publicPath = join(resolve('public'), url);
         if (existsSync(publicPath)) return next();
@@ -20,7 +20,8 @@ function serveOutputPlugin() {
         const outputPath = join(resolve('output'), url.replace(/^\//, ''));
         if (existsSync(outputPath)) {
           const { size } = statSync(outputPath);
-          res.setHeader('Content-Type', 'model/gltf-binary');
+          const mime = url.endsWith('.json') ? 'application/json' : 'model/gltf-binary';
+          res.setHeader('Content-Type', mime);
           res.setHeader('Content-Length', String(size));
           createReadStream(outputPath).pipe(res);
           return;

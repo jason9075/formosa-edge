@@ -13,6 +13,8 @@
 
         python = pkgs.python313.withPackages (ps: [
           ps.numpy
+          ps.pyshp
+          ps.pyproj
         ]);
       in
       {

@@ -20,6 +20,10 @@ convert-fast:
 convert-100m:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_100m.glb --step 5
 
+# Extract township boundary rings from shapefile → output/boundaries.json
+convert-boundaries:
+    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taipei_100m.glb output/boundaries.json
+
 # 100m + 2× elevation exaggeration
 convert-exag:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_exag.glb --step 5 --z-scale 2.0

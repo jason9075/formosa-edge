@@ -22,6 +22,7 @@ const gridToggle       = /** @type {HTMLInputElement}  */ (document.getElementBy
 const gridSpacingRow   = document.getElementById('grid-spacing-row');
 const gridSpacingSelect = /** @type {HTMLSelectElement} */ (document.getElementById('grid-spacing'));
 const colorMapSelect   = /** @type {HTMLSelectElement} */ (document.getElementById('color-map'));
+const boundariesToggle = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
 const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
@@ -116,6 +117,11 @@ let hintTimer = null;
 let introStartTime = /** @type {number|null} */ (null);
 let introComplete = false;
 const INTRO_MS = 3000;
+
+// Boundary overlay state
+/** @type {THREE.Group|null} */
+let boundaryGroup = null;
+const BOUNDARY_LIFT = 50; // metres above terrain max (in geometry Y-space)
 
 // LOD state
 /** @type {Map<string, THREE.BufferGeometry>} */
@@ -303,6 +309,7 @@ zScaleSlider.addEventListener('input', () => {
   userZScale = parseFloat(zScaleSlider.value);
   zScaleValue.textContent = `${userZScale.toFixed(1)}×`;
   if (terrainGroup) terrainGroup.scale.y = userZScale;
+  updateBoundaryY();
 });
 
 wireframeToggle.addEventListener('change', () => {
@@ -386,6 +393,7 @@ async function switchLod(url) {
     scene.remove(oldGroup);
     scene.add(terrainGroup);
     applyVertexColors(terrainMeshes, currentColorMap);
+    updateBoundaryY();
 
     activeLodUrl = url;
     setLodBadge(lvl?.label ?? url, false);
@@ -470,6 +478,68 @@ function buildTerrainGroup(geometry) {
   terrainBBox   = new THREE.Box3();
   for (const m of meshes) terrainBBox.union(m.geometry.boundingBox);
 }
+
+// ── Admin boundary overlay ───────────────────────────────────────────────────────
+const boundaryMat = new THREE.LineBasicMaterial({
+  color: 0xffe566,
+  transparent: true,
+  opacity: 0.75,
+});
+
+/**
+ * Lift boundary group so it hovers just above the highest terrain point in world space.
+ * terrainBBox.max.y is in geometry space; terrainGroup.scale.y = userZScale stretches it.
+ */
+function updateBoundaryY() {
+  if (!boundaryGroup || !terrainBBox) return;
+  boundaryGroup.position.y = terrainBBox.max.y * userZScale + BOUNDARY_LIFT;
+}
+
+/**
+ * Build a THREE.Group of LineLoops from the rings array in boundaries.json.
+ * Each vertex is [x, z] in Three.js local space; Y is set to 0 and the group
+ * is translated via updateBoundaryY().
+ *
+ * @param {Array<Array<[number, number]>>} rings
+ * @returns {THREE.Group}
+ */
+function buildBoundaryGroup(rings) {
+  const group = new THREE.Group();
+  for (const ring of rings) {
+    if (ring.length < 2) continue;
+    const positions = new Float32Array(ring.length * 3);
+    for (let i = 0; i < ring.length; i++) {
+      positions[i * 3]     = ring[i][0];
+      positions[i * 3 + 1] = 0;
+      positions[i * 3 + 2] = ring[i][1];
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    group.add(new THREE.LineLoop(geom, boundaryMat));
+  }
+  return group;
+}
+
+// Load boundaries.json produced by `just convert-boundaries`.
+// Non-fatal: silently skips if the file doesn't exist yet.
+fetch('/boundaries.json')
+  .then((r) => {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  })
+  .then((data) => {
+    boundaryGroup = buildBoundaryGroup(data.rings ?? []);
+    boundaryGroup.visible = boundariesToggle.checked;
+    updateBoundaryY();
+    scene.add(boundaryGroup);
+  })
+  .catch(() => {
+    console.info('[boundaries] Not found — run: just convert-boundaries');
+  });
+
+boundariesToggle.addEventListener('change', () => {
+  if (boundaryGroup) boundaryGroup.visible = boundariesToggle.checked;
+});
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
 const loader = new GLTFLoader();
@@ -559,6 +629,7 @@ const loader = new GLTFLoader();
       if (userZScale !== 1) terrainGroup.scale.y = userZScale;
 
       scene.add(terrainGroup);
+      updateBoundaryY();
       setLodBadge('100 m');
 
       progressFill.style.width = '100%';
