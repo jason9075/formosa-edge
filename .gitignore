@@ -1,6 +1,6 @@
 raw/
 line/
-public/
+output/
 *.zip
 
 # Nix
