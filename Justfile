@@ -91,8 +91,9 @@ convert-roads:
     python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taiwan_100m.glb output/roads.json
 
 # Extract township boundary rings from shapefile → output/boundaries.json
+# --simplify 5: 5 m Douglas-Peucker (imperceptible from altitude, ~halves the file)
 convert-boundaries:
-    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taiwan_100m.glb output/boundaries.json
+    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taiwan_100m.glb output/boundaries.json --simplify 5
 
 # 100m + 2× elevation exaggeration
 convert-exag:

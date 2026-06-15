@@ -9,12 +9,13 @@ Road class mapping (ROADCLASS1):
   1E       → expressway 快速公路
   1U, 1W   → provincial 省道
 
-Output JSON (per-class flat XZ arrays in LineSegments edge-pair format):
-  { "highway": [x0,z0,x1,z1, ...], "expressway": [...], "provincial": [...] }
+Output JSON (per-class array of polyline strips):
+  { "highway": [[x0,z0,x1,z1,...], [...]], "expressway": [...], "provincial": [...] }
 
-Each consecutive pair (x0,z0),(x1,z1) is one edge of the original polyline.
-Three.js reads this directly as a LineSegments BufferGeometry with Y=0;
-the road Group is lifted by roadGroup.position.y in the viewer.
+Each inner array is one polyline as a flat XZ strip (no vertex duplication — half the
+size of the old edge-pair format). The viewer expands each strip into edge pairs and
+merges a class into a single LineSegments2 (one draw call/class); the road Group is
+lifted by roadGroup.position.y.
 
 Usage:
   python3 road_to_json.py raw/road/ROAD_*.shp output/taipei_100m.glb output/roads.json
@@ -26,6 +27,7 @@ import struct
 from pathlib import Path
 
 import shapefile
+from shapely.geometry import LineString
 
 
 def read_glb_meta(glb_path: Path) -> dict:
@@ -35,7 +37,11 @@ def read_glb_meta(glb_path: Path) -> dict:
         f.read(4)
         data = json.loads(f.read(json_len))
     extras = data.get('extras', {})
-    acc = data['accessors'][0]
+    # Resolve the POSITION accessor via the primitive (Draco compression reorders
+    # accessors, so index 0 is not necessarily POSITION). POSITION always carries
+    # min/max per the glTF spec.
+    pos_idx = data['meshes'][0]['primitives'][0]['attributes']['POSITION']
+    acc = data['accessors'][pos_idx]
     return {
         'x_center': float(extras.get('x_center', 0)),
         'y_center': float(extras.get('y_center', 0)),
@@ -64,6 +70,9 @@ def main() -> None:
     parser.add_argument('output',    type=Path, help='Output .json path')
     parser.add_argument('--margin',  type=float, default=1000, metavar='M',
                         help='Extra metres around terrain bbox to include')
+    parser.add_argument('--simplify', type=float, default=1.0, metavar='M',
+                        help='Douglas-Peucker tolerance in metres (0 = off); '
+                             'coords are also rounded to 1 m integers')
     args = parser.parse_args()
 
     print('Reading GLB metadata…')
@@ -84,7 +93,7 @@ def main() -> None:
     i_cls = fields.index('ROADCLASS1')
     print(f'  Total records: {len(sf.shapes()):,}')
 
-    buckets: dict[str, list[float]] = {'highway': [], 'expressway': [], 'provincial': []}
+    buckets: dict[str, list[list[float]]] = {'highway': [], 'expressway': [], 'provincial': []}
     skipped = 0
 
     for sr in sf.iterShapeRecords():
@@ -108,25 +117,30 @@ def main() -> None:
                 skipped += 1
                 continue
 
-            # Three.js coordinate mapping (same as GLB vertices):
-            #   X =  Easting  - x_center
-            #   Z = -(Northing - y_center)
-            prev_x = round(pts[0][0] - xc, 1)
-            prev_z = round(-(pts[0][1] - yc), 1)
-            for p in pts[1:]:
-                cur_x = round(p[0] - xc, 1)
-                cur_z = round(-(p[1] - yc), 1)
-                # Emit as edge pair for THREE.LineSegments
-                buf.extend([prev_x, prev_z, cur_x, cur_z])
-                prev_x, prev_z = cur_x, cur_z
+            # Douglas-Peucker drop near-collinear vertices (1 m tolerance) in EPSG:3826
+            # metres, before mapping to local space.
+            if args.simplify > 0:
+                pts = list(LineString(pts).simplify(args.simplify, preserve_topology=False).coords)
+                if len(pts) < 2:
+                    continue
 
-    total_edges = 0
+            # Three.js coordinate mapping (same as GLB vertices), as a polyline strip:
+            #   X =  Easting  - x_center        Z = -(Northing - y_center)
+            # round() → 1 m integers (no ".x" decimals → smaller JSON)
+            strip = []
+            for p in pts:
+                strip.append(round(p[0] - xc))
+                strip.append(round(-(p[1] - yc)))
+            if len(strip) >= 4:  # ≥ 2 points
+                buf.append(strip)
+
+    total_pts = 0
     for cls, buf in buckets.items():
-        edges = len(buf) // 4
-        total_edges += edges
-        print(f'  {cls:12s}: {edges:,} edges')
+        pts = sum(len(s) // 2 for s in buf)
+        total_pts += pts
+        print(f'  {cls:12s}: {len(buf):,} polylines, {pts:,} points')
     print(f'  Skipped {skipped} parts outside extent')
-    print(f'  Total edges: {total_edges:,}')
+    print(f'  Total points: {total_pts:,}')
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(buckets, separators=(',', ':')), encoding='utf-8')

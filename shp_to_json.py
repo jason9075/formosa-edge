@@ -20,6 +20,7 @@ from pathlib import Path
 
 import shapefile
 from pyproj import Transformer
+from shapely.geometry import LineString
 
 
 def read_glb_meta(glb_path: Path) -> dict:
@@ -31,7 +32,10 @@ def read_glb_meta(glb_path: Path) -> dict:
         data = json.loads(f.read(json_len))
 
     extras = data.get('extras', {})
-    acc    = data['accessors'][0]  # POSITION accessor always first
+    # Resolve POSITION via the primitive — Draco compression reorders accessors, so
+    # index 0 is not necessarily POSITION. POSITION always carries min/max (glTF spec).
+    pos_idx = data['meshes'][0]['primitives'][0]['attributes']['POSITION']
+    acc     = data['accessors'][pos_idx]
 
     return {
         'x_center': float(extras.get('x_center', 0)),
@@ -55,6 +59,10 @@ def main() -> None:
     parser.add_argument(
         '--margin', type=float, default=2000,
         metavar='M', help='Extra metres around terrain bbox to include (default 2000)',
+    )
+    parser.add_argument(
+        '--simplify', type=float, default=1.0, metavar='M',
+        help='Douglas-Peucker tolerance in metres (0 = off); coords also rounded to 1 m',
     )
     args = parser.parse_args()
 
@@ -126,10 +134,15 @@ def main() -> None:
                 continue
 
             # Convert to Three.js local space (same transform as GLB vertices)
-            ring = [
-                [round(float(e - xc), 1), round(float(-(n - yc)), 1)]
-                for e, n in zip(es, ns)
-            ]
+            local = [(float(e - xc), float(-(n - yc))) for e, n in zip(es, ns)]
+            # Douglas-Peucker (1 m) to drop near-collinear ring vertices
+            if args.simplify > 0:
+                local = list(LineString(local).simplify(args.simplify, preserve_topology=True).coords)
+                if len(local) < 3:
+                    skipped += 1
+                    continue
+            # round() → 1 m integers (no ".x" decimals → smaller JSON)
+            ring = [[round(x), round(z)] for x, z in local]
             rings.append(ring)
             names.append(name)
 

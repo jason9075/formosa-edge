@@ -1403,8 +1403,17 @@ function buildRoadGroup(data) {
     { key: 'provincial', color: 0x66ccaa, width: 3.0, opacity: 0.90 },
   ];
   for (const { key, color, width, opacity } of classes) {
-    const flat = data[key];
-    if (!flat || flat.length < 4) continue;
+    // roads.json stores polyline strips per class ([[x,z,x,z,...], ...]); expand each
+    // strip into LineSegments edge pairs and merge the class into one geometry.
+    const strips = data[key];
+    if (!strips || strips.length === 0) continue;
+    const flat = [];
+    for (const s of strips) {
+      for (let i = 0; i + 3 < s.length; i += 2) {
+        flat.push(s[i], s[i + 1], s[i + 2], s[i + 3]);
+      }
+    }
+    if (flat.length < 4) continue;
     const edgeCount = flat.length / 4;
     const positions = new Float32Array(edgeCount * 6);
     for (let i = 0; i < edgeCount; i++) {
