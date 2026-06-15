@@ -329,8 +329,11 @@ const boxLoading     = new Set();
 let buildingFrameCount = 0;
 // Plain white material — the existing directional light gives clean faceted shading
 // (Mirror's Edge look); no TWD97 grid overlay (unlike terrainMat).
+// FrontSide (not DoubleSide): adjacent buildings share wall planes back-to-back; with
+// double-sided faces both render at the same depth → z-fighting. Back-face culling shows
+// only the outward face. Winding is outward for both box and massing geometry.
 const buildingMat = new THREE.MeshStandardMaterial({
-  color: 0xffffff, roughness: 0.92, metalness: 0.0, side: THREE.DoubleSide,
+  color: 0xffffff, roughness: 0.92, metalness: 0.0, side: THREE.FrontSide,
 });
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
