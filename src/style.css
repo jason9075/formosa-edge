@@ -10,7 +10,9 @@
   --border:     rgba(255, 255, 255, 0.08);
   --text:       #e0e0e0;
   --text-muted: #888;
-  --accent:     #4fc3f7;
+  --accent:      #e53935;                 /* Mirror's Edge red */
+  --accent-soft: rgba(229, 57, 53, 0.12); /* translucent fills (badges/chips/hover) */
+  --accent-line: rgba(229, 57, 53, 0.32); /* translucent borders */
   --top-h:      40px;
   --bottom-h:   48px;
   --panel-w:    260px;
@@ -40,8 +42,6 @@ body {
   position: fixed;
   top: 0; left: 0; right: 0;
   height: var(--top-h);
-  background: rgba(0, 0, 0, 0.60);
-  backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -57,53 +57,98 @@ body {
   font-weight: 500;
 }
 
-#panel-toggle {
-  background: none;
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  height: 100%;
+}
+
+/* 💡 knowledge button — header icon button (moved out of the floating FAB) */
+#open-math {
+  background: rgba(0, 0, 0, 0.05);
   border: 1px solid var(--border);
   color: var(--text);
   border-radius: 6px;
   width: 28px;
   height: 28px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 15px;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s;
+  transition: background 0.15s, transform 0.15s;
   flex-shrink: 0;
 }
-#panel-toggle:hover { background: rgba(255, 255, 255, 0.08); }
+#open-math:hover { background: var(--accent-soft); transform: scale(1.08); }
 
 /* ── Control panel ─────────────────────────────────────────────── */
+/* Light frosted-glass surfaces — header, side panel, footer share one light theme.
+   Redefining these custom properties here cascades to every descendant using
+   var(--text/--border/...); --accent stays the global red. Low alpha + heavy blur
+   lets the terrain show through (frosted glass). */
+#top-bar, #control-panel, #bottom-bar, #panel-toggle {
+  --panel-bg:   rgba(248, 249, 252, 0.42);
+  --text:       #1b1b24;
+  --text-muted: #50505c;
+  --border:     rgba(0, 0, 0, 0.14);
+  color: var(--text);
+  background: var(--panel-bg);
+  backdrop-filter: blur(18px) saturate(1.5);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+}
+
 #control-panel {
   position: fixed;
   top: var(--top-h);
   right: 0;
   bottom: var(--bottom-h);
   width: var(--panel-w);
-  background: var(--panel-bg);
-  backdrop-filter: blur(12px);
   border-left: 1px solid var(--border);
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 20;
-  transition: width 0.25s ease;
+  transition: right 0.25s ease;
   padding: 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
 }
 
+/* Collapsed: slide the whole panel off the right edge; only the pull-tab remains. */
 #control-panel[data-open="0"] {
-  width: var(--panel-icon);
-  padding: 0;
-  overflow: hidden;
+  right: calc(-1 * var(--panel-w));
+}
+#control-panel[data-open="0"] ~ #panel-toggle {
+  right: 0;
 }
 
-#control-panel[data-open="0"] .panel-section {
-  opacity: 0;
-  pointer-events: none;
+/* Panel pull-tab — rounded protrusion on the panel's LEFT edge, same frosted
+   material as the panel. Pinned to the panel's left edge via right:var(--panel-w);
+   when the panel collapses off-screen, the tab rides to the viewport edge (right:0).
+   Placed after the shared light-surface rule so its accent colour/shape win. */
+#panel-toggle {
+  position: fixed;
+  top: calc(var(--top-h) + 22px);     /* near the top, aligned with the first section */
+  right: var(--panel-w);
+  width: 26px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-right: none;                 /* merge seamlessly into the panel edge */
+  border-radius: 12px 0 0 12px;       /* round only the protruding (left) corners */
+  color: var(--accent);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 21;                        /* above the panel border */
+  box-shadow: -2px 0 8px rgba(0, 0, 0, 0.12);
+  transition: right 0.25s ease, background 0.15s;
 }
+#panel-toggle:hover { background: var(--accent-soft); }
 
 .panel-section {
   border: 1px solid var(--border);
@@ -142,8 +187,8 @@ button, select {
 }
 
 button:hover, select:hover {
-  background: rgba(79, 195, 247, 0.10);
-  border-color: rgba(79, 195, 247, 0.35);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
 }
 
 select {
@@ -240,9 +285,9 @@ input[type="range"]::-moz-range-thumb {
 
 .chip {
   font-size: 0.6rem;
-  background: rgba(79, 195, 247, 0.12);
+  background: var(--accent-soft);
   color: var(--accent);
-  border: 1px solid rgba(79, 195, 247, 0.25);
+  border: 1px solid var(--accent-line);
   border-radius: 4px;
   padding: 1px 5px;
   letter-spacing: 0.04em;
@@ -278,13 +323,15 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text-muted);
   font-size: 12px;
 }
+/* `display:flex` above overrides the bare `hidden` attribute, so hide explicitly */
+.lod-row[hidden] { display: none; }
 
 #lod-badge {
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
   font-size: 11px;
   color: var(--accent);
-  background: rgba(79, 195, 247, 0.10);
-  border: 1px solid rgba(79, 195, 247, 0.25);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
   border-radius: 4px;
   padding: 2px 7px;
   transition: color 0.2s, border-color 0.2s;
@@ -295,13 +342,27 @@ input[type="range"]::-moz-range-thumb {
   border-color: var(--border);
 }
 
+/* Light-panel overrides for controls that hardcoded dark-theme fills (the rules
+   above assume white-on-dark; on the light panel these need subtle dark tints). */
+#control-panel button,
+#control-panel select {
+  background: rgba(0, 0, 0, 0.04);
+}
+#control-panel select { background-color: rgba(0, 0, 0, 0.04); }
+#control-panel input[type="range"] { background: rgba(0, 0, 0, 0.14); }
+#control-panel .roads-sub { border-left-color: rgba(0, 0, 0, 0.12); }
+/* Re-assert hover at id specificity (the rules above would otherwise win over button:hover) */
+#control-panel button:hover,
+#control-panel select:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
 /* ── Bottom bar ────────────────────────────────────────────────── */
 #bottom-bar {
   position: fixed;
   bottom: 0; left: 0; right: 0;
   height: var(--bottom-h);
-  background: rgba(0, 0, 0, 0.60);
-  backdrop-filter: blur(8px);
   border-top: 1px solid var(--border);
   display: grid;
   grid-template-columns: 1fr 1.4fr 1fr;
@@ -470,31 +531,6 @@ input[type="range"]::-moz-range-thumb {
 
 /* KaTeX display math overflow */
 .katex-display { overflow-x: auto; overflow-y: hidden; }
-
-/* ── 💡 FAB ────────────────────────────────────────────────────── */
-.fab {
-  position: fixed;
-  bottom: calc(var(--bottom-h) + 1rem);
-  right: 1rem;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--panel-bg);
-  backdrop-filter: blur(8px);
-  cursor: pointer;
-  font-size: 18px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 25;
-  transition: transform 0.15s, background 0.15s;
-}
-
-.fab:hover {
-  transform: scale(1.12);
-  background: rgba(79, 195, 247, 0.15);
-}
 
 /* ── Responsive ────────────────────────────────────────────────── */
 @media (max-width: 1279px) {

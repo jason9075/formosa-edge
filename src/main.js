@@ -120,6 +120,18 @@ const hemi = new THREE.HemisphereLight(0xeaf2ff, 0x6f8fb5, 0.9);
 scene.add(dirLight);
 scene.add(hemi);
 
+// Sea: a large horizontal plane at sea level (y≈0), the same blue as the rivers.
+// The DTM drops sea/no-data vertices, so without this the ocean reads as the sky
+// background; this plane gives a distinct water surface that fogs into the horizon.
+// Sits just below 0 so coastal land covers its edge. Only shown in the Edge theme.
+const seaMat = new THREE.MeshBasicMaterial({ color: 0x4a90d9, fog: true, side: THREE.DoubleSide });
+const seaPlane = new THREE.Mesh(new THREE.PlaneGeometry(2_000_000, 2_000_000), seaMat);
+seaPlane.rotation.x = -Math.PI / 2; // lay flat in the XZ plane
+seaPlane.position.y = -2;
+seaPlane.renderOrder = -1;          // behind terrain/tiles
+seaPlane.visible = false;           // toggled by applyTheme (Edge only)
+scene.add(seaPlane);
+
 // Shadows: the directional light + its orthographic shadow camera FOLLOW the orbit
 // target each frame, sized to the building view (a few km) — full-island shadow maps
 // would be useless resolution. SHADOW_DIST is how far back the light sits.
@@ -358,7 +370,7 @@ const buildingMat = new THREE.MeshStandardMaterial({
 function setPanelOpen(open) {
   panelOpen = open;
   controlPanel.dataset.open = open ? '1' : '0';
-  panelToggleBtn.textContent = open ? '✕' : '☰';
+  panelToggleBtn.textContent = open ? '›' : '‹'; // › collapse (panel slides right) / ‹ expand
   panelToggleBtn.setAttribute('aria-expanded', String(open));
 }
 setPanelOpen(panelOpen);
@@ -1207,6 +1219,7 @@ function applyTheme(map) {
   const me = map === 'edge';
   scene.background = me ? SKY_COLOR : DARK_BG;
   scene.fog = me ? meFog : null;
+  seaPlane.visible = me;
   if (me) {
     hemi.color.set(0xeaf2ff);
     hemi.groundColor.set(0x6f8fb5);
@@ -1526,6 +1539,7 @@ timeSlider.addEventListener('input', () => {
   setSunFromHour(hour);
 });
 setSunFromHour(parseFloat(timeSlider.value)); // initialise sun from the default slider value
+colorMapSelect.value = currentColorMap;       // force Edge default (defeat browser form restore)
 applyTheme(currentColorMap);                  // apply the default colour map's scene look
 
 
@@ -1848,6 +1862,13 @@ let lastFrameTime = 0;
     const alt = camera.position.y - terrainBBox.min.y;
     if (alt < 20000) { scene.fog.near = 18000;  scene.fog.far = 110000; }
     else             { scene.fog.near = 300000; scene.fog.far = 1200000; }
+  }
+
+  // Keep the sea just below the LOWEST terrain point (scales with Z-Scale) so it
+  // fills the ocean + no-data gaps without ever flooding low-lying land (the Taipei
+  // basin / river mouths reach ≈ −5 m, which a fixed sea plane would submerge).
+  if (seaPlane.visible && terrainBBox) {
+    seaPlane.position.y = (terrainBBox.min.y - 1) * userZScale;
   }
 
   controls.update();

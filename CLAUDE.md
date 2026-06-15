@@ -1,4 +1,4 @@
-# CLAUDE.md — DTM Visualizer
+# CLAUDE.md — Formosa's Edge (Taiwan 3D Terrain)
 
 Project-specific guidance for Claude Code. See `README.md` for the full mechanism write-up.
 

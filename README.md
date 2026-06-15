@@ -1,4 +1,4 @@
-# DTM Visualizer — Taiwan
+# Formosa's Edge — Taiwan 3D Terrain
 
 An interactive 3D terrain viewer for Taiwan's **main island** (19 counties merged into one map),
 built with Three.js and Vite. Raw elevation data is converted from government photogrammetry tiles
