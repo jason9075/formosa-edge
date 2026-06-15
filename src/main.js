@@ -16,7 +16,6 @@ const panelToggleBtn  = document.getElementById('panel-toggle');
 const controlPanel    = document.getElementById('control-panel');
 const resetCameraBtn  = document.getElementById('reset-camera');
 const topViewBtn      = document.getElementById('top-view');
-const sideViewBtn     = document.getElementById('side-view');
 const zScaleSlider    = /** @type {HTMLInputElement}  */ (document.getElementById('z-scale'));
 const zScaleValue     = document.getElementById('z-scale-value');
 const wireframeToggle  = /** @type {HTMLInputElement}  */ (document.getElementById('wireframe-toggle'));
@@ -203,9 +202,7 @@ let currentColorMap = 'terrain';
 let panelOpen = window.innerWidth >= 1280;
 let modalLang = 'en';
 let hintTimer = null;
-let introStartTime = /** @type {number|null} */ (null);
 let introComplete = false;
-const INTRO_MS = 3000;
 
 // Boundary overlay state
 /** @type {THREE.Group|null} */
@@ -292,17 +289,16 @@ function getTerrainInfo() {
   return { center, size, diag };
 }
 
+// Reset to the initial Taipei viewpoint (north up).
+// GLB local: x = TWD97_E - x_center, z = -(TWD97_N - y_center)
 function cameraReset() {
-  const info = getTerrainInfo();
-  if (!info) return;
-  const { center, diag } = info;
-  controls.target.copy(center);
-  // NE of center, looking SW at ~38° elevation angle
-  camera.position.set(
-    center.x + diag * 0.45,
-    center.y + diag * 0.45,
-    center.z + diag * 0.45
-  );
+  if (!terrainBBox) return;
+  const taipeiX = 305000 - (glbMeta.x_center ?? 0);
+  const taipeiZ = -(2773000 - (glbMeta.y_center ?? 0));
+  const floorY  = terrainBBox.min.y;
+  controls.target.set(taipeiX, floorY, taipeiZ);
+  // Due-south (+Z) of target so the view direction is -Z (north up).
+  camera.position.set(taipeiX, floorY + 22000, taipeiZ + 22000);
   controls.update();
 }
 
@@ -315,18 +311,8 @@ function cameraTop() {
   controls.update();
 }
 
-function cameraSide() {
-  const info = getTerrainInfo();
-  if (!info) return;
-  const { center, size } = info;
-  controls.target.copy(center);
-  camera.position.set(center.x, center.y + size.y * 0.5, center.z + Math.max(size.x, size.z) * 0.8);
-  controls.update();
-}
-
 resetCameraBtn.addEventListener('click', cameraReset);
 topViewBtn.addEventListener('click', cameraTop);
-sideViewBtn.addEventListener('click', cameraSide);
 
 // ── Fly keys ─────────────────────────────────────────────────────────────────────
 const keysDown = new Set();
@@ -666,6 +652,7 @@ function disposeTile(map, group, key) {
   group.remove(m);
   m.geometry.dispose();
   map.delete(key);
+  if (map === detailTiles && detailTileGrids.delete(key)) scheduleRoadRebake();
 }
 
 /**
@@ -697,6 +684,11 @@ function loadTile(tile, level) {
       if (isDetail && baseTiles.has(tile.key)) disposeTile(baseTiles, baseTileGroup, tile.key);
       group.add(m);
       map.set(tile.key, m);
+      // Build per-tile 20 m height grid and schedule road elevation rebake.
+      if (isDetail) {
+        detailTileGrids.set(tile.key, buildDetailTileGrid(mesh.geometry));
+        scheduleRoadRebake();
+      }
       setDetailBadge();
     },
     undefined,
@@ -923,7 +915,65 @@ function buildTerrainGroup(geometry) {
 // ── Terrain height grid (for road elevation lookup) ──────────────────────────────
 /** @type {Map<string, number>|null} built once from first terrain load */
 let terrainHeightGrid = null;
-const HEIGHT_SNAP = 100; // metres — matches the coarsest (100 m) GLB grid
+const HEIGHT_SNAP  = 100; // metres — coarsest (100 m) GLB grid
+const DETAIL_SNAP  = 20;  // metres — 20 m tile grid resolution
+
+// Per-tile mini height-maps built as 20 m tiles load; keyed by tile key.
+/** @type {Map<string, Map<string, number>>} */
+const detailTileGrids = new Map();
+
+// Spatial index: `${gridI},${gridJ}` → tile key. Built when tileIndex loads.
+// Grid indices are relative to the minimum tile center to avoid floating-point
+// misalignment when centers are not at exact multiples of tileSize.
+/** @type {Map<string, string>|null} */
+let tileSpatialIndex  = null;
+let tileSpatialSnap   = 5000; // tileSize from index.json
+let tileSpatialOrigin = { x: 0, z: 0 }; // minimum (cx, cz)
+
+/** Debounce handle for re-baking road elevations after detail tiles change. */
+let roadRebakeTimer = null;
+function scheduleRoadRebake() {
+  clearTimeout(roadRebakeTimer);
+  roadRebakeTimer = setTimeout(applyRoadElevations, 400);
+}
+
+/** Build the tile spatial index once tileIndex is available. */
+function buildTileSpatialIndex() {
+  tileSpatialSnap = tileIndex.tileSize ?? 5000;
+  // Normalise relative to the minimum centre so that Math.round works correctly
+  // even when tile centres are not at exact multiples of tileSize.
+  let minCx = Infinity, minCz = Infinity;
+  for (const t of tileIndex.tiles) {
+    if (t.cx < minCx) minCx = t.cx;
+    if (t.cz < minCz) minCz = t.cz;
+  }
+  tileSpatialOrigin = { x: minCx, z: minCz };
+  tileSpatialIndex  = new Map();
+  for (const t of tileIndex.tiles) {
+    const gx = Math.round((t.cx - minCx) / tileSpatialSnap);
+    const gz = Math.round((t.cz - minCz) / tileSpatialSnap);
+    tileSpatialIndex.set(`${gx},${gz}`, t.key);
+  }
+}
+
+/**
+ * Build a 20 m resolution height-map for one detail tile geometry.
+ * @param {THREE.BufferGeometry} geometry
+ * @returns {Map<string, number>}
+ */
+function buildDetailTileGrid(geometry) {
+  const grid = new Map();
+  const pos  = geometry.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const gx  = Math.round(pos.getX(i) / DETAIL_SNAP);
+    const gz  = Math.round(pos.getZ(i) / DETAIL_SNAP);
+    const key = `${gx},${gz}`;
+    const y   = pos.getY(i);
+    const cur = grid.get(key);
+    if (cur === undefined || y > cur) grid.set(key, y);
+  }
+  return grid;
+}
 
 function buildTerrainHeightGrid() {
   terrainHeightGrid = new Map();
@@ -942,13 +992,38 @@ function buildTerrainHeightGrid() {
 }
 
 /**
- * Nearest-neighbour terrain elevation at any (x, z) in GLB local space.
+ * Terrain elevation at (x, z) in GLB local space.
+ * Prefers 20 m detail tile data when the tile is loaded; falls back to 100 m grid.
+ * Takes the max of the 4 surrounding grid corners so roads never sink between samples.
  * @param {number} x @param {number} z @returns {number}
  */
 function sampleTerrainHeight(x, z) {
+  // 20 m detail tile lookup — O(1) via spatial index
+  if (tileSpatialIndex) {
+    const sgx = Math.round((x - tileSpatialOrigin.x) / tileSpatialSnap);
+    const sgz = Math.round((z - tileSpatialOrigin.z) / tileSpatialSnap);
+    const tileKey = tileSpatialIndex.get(`${sgx},${sgz}`);
+    if (tileKey) {
+      const grid = detailTileGrids.get(tileKey);
+      if (grid) {
+        const dgx = x / DETAIL_SNAP;
+        const dgz = z / DETAIL_SNAP;
+        const x0 = Math.floor(dgx), x1 = x0 + 1;
+        const z0 = Math.floor(dgz), z1 = z0 + 1;
+        let maxY;
+        for (const cx of [x0, x1]) {
+          for (const cz of [z0, z1]) {
+            const y = grid.get(`${cx},${cz}`);
+            if (y !== undefined && (maxY === undefined || y > maxY)) maxY = y;
+          }
+        }
+        if (maxY !== undefined) return maxY;
+      }
+    }
+  }
+
+  // 100 m fallback
   if (!terrainHeightGrid || !terrainBBox) return terrainBBox?.min.y ?? 0;
-  // Take the max of the 4 surrounding grid-cell corners so the road never dips
-  // below the actual terrain between sample points.
   const gx = x / HEIGHT_SNAP;
   const gz = z / HEIGHT_SNAP;
   const x0 = Math.floor(gx), x1 = x0 + 1;
@@ -969,7 +1044,7 @@ let roadGroup = null;
 /** @type {Map<string, THREE.LineSegments>} */
 const roadLayers = new Map();
 // Roads float ROAD_LIFT world-metres above terrain; scale.y tracks userZScale.
-const ROAD_LIFT = 20;
+const ROAD_LIFT = 80;
 
 /**
  * After terrain height grid is ready, bake per-vertex elevation into road buffers.
@@ -1241,8 +1316,13 @@ loader.setDRACOLoader(dracoLoader);
       scene.add(baseTileGroup);
       fetch(import.meta.env.BASE_URL + 'tiles/index.json')
         .then((r) => (r.ok ? r.json() : null))
-        .then((d) => { if (d && d.tiles) tileIndex = d; })
+        .then((d) => { if (d && d.tiles) { tileIndex = d; buildTileSpatialIndex(); } })
         .catch(() => { console.info('[tiles] tiles/index.json not found — run: just tile'); });
+
+      // Skip intro animation — jump straight to the initial Taipei viewpoint.
+      cameraReset();
+      controls.enabled = true;
+      introComplete    = true;
 
       progressFill.style.width = '100%';
       setTimeout(() => { loadingOverlay.hidden = true; }, 350);
@@ -1263,36 +1343,6 @@ loader.setDRACOLoader(dracoLoader);
     }
   );
 }());
-
-// ── Intro orbit animation ────────────────────────────────────────────────────────
-function tickIntro(t) {
-  const info = getTerrainInfo();
-  if (!info) return;
-
-  if (introStartTime === null) {
-    introStartTime = t;
-    controls.enabled = false;
-  }
-
-  const progress = Math.min((t - introStartTime) / INTRO_MS, 1);
-  const { center, diag } = info;
-
-  // Start facing NE, sweep 90° CCW
-  const angle = -Math.PI * 0.25 + progress * Math.PI * 0.5;
-  camera.position.set(
-    center.x + Math.sin(angle) * diag * 0.55,
-    center.y + diag * 0.44,
-    center.z + Math.cos(angle) * diag * 0.55
-  );
-  camera.lookAt(center);
-  controls.target.copy(center);
-
-  if (progress >= 1) {
-    introComplete = true;
-    controls.enabled = true;
-    controls.update();
-  }
-}
 
 // ── WASD / QE fly movement ───────────────────────────────────────────────────────
 // Reuse vectors to avoid GC pressure in the hot path.
@@ -1336,6 +1386,84 @@ function tickFlyKeys(dt) {
   controls.target.add(_flyDelta);
 }
 
+// ── Compass gizmo (mini 3D scene, ViewHelper-style) ────────────────────────────────
+// A separate scene rendered into a corner viewport, viewed from the same orientation
+// as the main camera, so the cardinal markers tilt in true 3D perspective as the
+// camera pitches/orbits — exactly like an axis gizmo.
+const GIZMO_SIZE = 76;           // CSS px (square)
+const GIZMO_MARGIN = 14;         // CSS px from viewport edge
+// Footer height — keep in sync with CSS --bottom-h so the gizmo sits above the bar.
+const BOTTOM_H = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--bottom-h')) || 48;
+const gizmoScene  = new THREE.Scene();
+const gizmoCamera = new THREE.OrthographicCamera(-1.15, 1.15, 1.15, -1.15, 0.1, 100);
+
+(function buildGizmo() {
+  // Minimalist compass needle lying in the XZ plane. GLB north is -Z.
+  // Slim diamond: north half red, south half light grey.
+  const y = 0;
+  const W = 0.12; // half-width at the centre
+  const mkHalf = (tipZ) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      0, y, tipZ,  W, y, 0,  -W, y, 0,
+    ]), 3));
+    g.computeVertexNormals();
+    return g;
+  };
+  gizmoScene.add(new THREE.Mesh(mkHalf(-0.92), new THREE.MeshBasicMaterial({ color: 0xff4444, side: THREE.DoubleSide })));
+  gizmoScene.add(new THREE.Mesh(mkHalf( 0.92), new THREE.MeshBasicMaterial({ color: 0xb8bcc4, side: THREE.DoubleSide })));
+
+  // Centre hub
+  gizmoScene.add(new THREE.Mesh(
+    new THREE.SphereGeometry(0.1, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xe4e7ec })
+  ));
+
+  // Single small "N" marker above the north tip.
+  const px = 64;
+  const c  = document.createElement('canvas');
+  c.width = c.height = px;
+  const ctx = c.getContext('2d');
+  ctx.font = 'bold 44px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ff5a5a';
+  ctx.fillText('N', px / 2, px / 2 + 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const nLabel = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false,
+  }));
+  nLabel.scale.setScalar(0.46);
+  nLabel.position.set(0, 0, -1.05);
+  gizmoScene.add(nLabel);
+})();
+
+/** Render the compass gizmo into the bottom-left corner, matching camera orientation. */
+function renderGizmo() {
+  // Mirror the main camera orientation EXACTLY by copying its quaternion, then place
+  // the gizmo camera back along its own local +Z so it looks at the origin. This avoids
+  // the lookAt + up-guess approach, which flipped N/S when viewing straight down.
+  gizmoCamera.quaternion.copy(camera.quaternion);
+  gizmoCamera.position.set(0, 0, 1).applyQuaternion(camera.quaternion).multiplyScalar(3);
+  gizmoCamera.updateMatrixWorld();
+
+  const dpr = renderer.getPixelRatio();
+  const x = GIZMO_MARGIN * dpr;
+  const y = (BOTTOM_H + GIZMO_MARGIN) * dpr; // WebGL origin is bottom-left; clear the footer
+  const s = GIZMO_SIZE * dpr;
+
+  renderer.setScissorTest(true);
+  renderer.setScissor(x, y, s, s);
+  renderer.setViewport(x, y, s, s);
+  renderer.autoClear = false;
+  renderer.clearDepth(); // depth only (scissored) so the gizmo isn't occluded; colour preserved
+  renderer.render(gizmoScene, gizmoCamera);
+  renderer.autoClear = true;
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+}
+
 // ── Render loop ──────────────────────────────────────────────────────────────────
 let lastFrameTime = 0;
 
@@ -1345,10 +1473,6 @@ let lastFrameTime = 0;
 
   const dt = Math.min((t - lastFrameTime) / 1000, 0.05);
   lastFrameTime = t;
-
-  if (terrainGroup && !introComplete) {
-    tickIntro(t);
-  }
 
   tickFlyKeys(dt);
 
@@ -1369,6 +1493,7 @@ let lastFrameTime = 0;
   if (++detailFrameCount % 15 === 0 && introComplete) updateTiles();
 
   renderer.render(scene, camera);
+  renderGizmo();
   stats.end();
 }(0));
 
