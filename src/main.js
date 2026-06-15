@@ -3,6 +3,7 @@ import { GLTFLoader }    from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader }   from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import renderMathInElement from 'katex/dist/contrib/auto-render';
+import createStats from './stats.js';
 import 'katex/dist/katex.min.css';
 import Prism from 'prismjs';
 import 'prismjs/components/prism-javascript.js';
@@ -46,7 +47,15 @@ const mathContent     = document.getElementById('math-content');
 const langToggle      = document.getElementById('language-toggle');
 
 // ── Three.js core ────────────────────────────────────────────────────────────────
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+// logarithmicDepthBuffer: the camera spans near=1 .. far=1e6 (full island), which
+// wrecks depth precision. stencil: the 100 m base stays visible as a backdrop and is
+// masked (stencil != 1) wherever a tile drew, so gaps while tiles stream show the 100 m
+// surface instead of black — no overlap, no flicker.
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true, stencil: true });
+
+// Performance HUD (MS / MB) pinned to the viewport's top-left.
+const stats = createStats();
+document.body.appendChild(stats.dom);
 renderer.setPixelRatio(window.devicePixelRatio);
 
 const scene = new THREE.Scene();
@@ -61,6 +70,11 @@ controls.dampingFactor  = 0.08;
 controls.zoomToCursor   = true;
 controls.screenSpacePanning = false;
 controls.enabled = false;  // disabled until terrain loads
+controls.addEventListener('change', () => {
+  cameraMoving = true;
+  clearTimeout(movingTimer);
+  movingTimer = setTimeout(() => { cameraMoving = false; }, 300);
+});
 
 // ── Lighting (from NW at 45°; X=East, Y=Up, Z=South in GLB) ────────────────────
 const dirLight = new THREE.DirectionalLight(0xfff5e8, 1.8);
@@ -195,6 +209,43 @@ const lodGroupCache = new Map();
 let activeLodUrl = '';
 let lodPending = false;
 let lodFrameCount = 0;
+
+// ── Detail-tile streaming (option C: 20 m tiles over the 100 m base) ───────────────
+// Global elevation range from the base mesh — detail tiles colour against the SAME
+// range so their palette matches the overview seamlessly.
+let baseYMin = 0;
+let baseYMax = 1;
+/** @type {THREE.MeshStandardMaterial|null} shared material for base + detail tiles */
+let tileMat = null;
+const detailGroup   = new THREE.Group(); // 20 m tiles
+const baseTileGroup = new THREE.Group(); // 100 m tiles
+/** @type {{center:number[], tileSize:number, tiles:{key:string,url:string,cx:number,cz:number}[]}|null} */
+let tileIndex = null;
+/** @type {Map<string, THREE.Mesh>} resident 20 m tiles, keyed by tile id */
+const detailTiles  = new Map();
+/** @type {Map<string, THREE.Mesh>} resident 100 m tiles, keyed by tile id */
+const baseTiles    = new Map();
+const detailLoading = new Set();
+const baseLoading   = new Set();
+let detailFrameCount = 0;
+// Tiled LOD state machine with hysteresis to prevent rapid toggling at the threshold.
+// Buffer zone [FAR_ALT_ENTER, FAR_ALT_EXIT] maintains the current state unchanged.
+const FAR_ALT_EXIT  = 22000; // rising above this while in tile mode → switch to monolithic
+const FAR_ALT_ENTER = 18000; // descending below this while in monolithic mode → pre-warm tiles
+const DETAIL_DIST   = 18000; // camera-still: within this of camera → upgrade to 20 m tile
+const DETAIL_EVICT  = 24000;
+const LOD_HYST      = 4000;  // keep a 20 m tile until this far past DETAIL_DIST (anti-thrash)
+const DETAIL_MAX    = 160;   // resident 20 m cap
+const BASE_MAX      = 320;   // resident 100 m cap
+const MAX_CONCURRENT = 8;
+// true = monolithic hidden, tile mode active. false = monolithic visible (high-alt or pre-warming).
+let tilesModeActive = false;
+let cameraMoving    = false;
+let movingTimer     = null;
+// Reused per-frame for frustum-based tile selection (no per-call allocation).
+const _detFrustum = new THREE.Frustum();
+const _detProj    = new THREE.Matrix4();
+const _detSphere  = new THREE.Sphere();
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
 function setPanelOpen(open) {
@@ -350,6 +401,9 @@ function applyVertexColors(meshes, mapName) {
   const fn    = COLOR_MAPS[mapName] ?? COLOR_MAPS.terrain;
   const range = (yMax - yMin) || 1;
 
+  // Remember the base range so detail tiles colour against the same scale.
+  if (!isSlope && !isAspect) { baseYMin = yMin; baseYMax = yMax; }
+
   // Pass 2: per-vertex colour
   for (const mesh of meshes) {
     const pos = mesh.geometry.attributes.position;
@@ -410,12 +464,17 @@ zScaleSlider.addEventListener('input', () => {
   userZScale = parseFloat(zScaleSlider.value);
   zScaleValue.textContent = `${userZScale.toFixed(1)}×`;
   if (terrainGroup) terrainGroup.scale.y = userZScale;
+  detailGroup.scale.y = userZScale;
+  baseTileGroup.scale.y = userZScale;
   updateRoadY();
   updateBoundaryY();
 });
 
 wireframeToggle.addEventListener('change', () => {
-  if (terrainMat) { terrainMat.wireframe = wireframeToggle.checked; terrainMat.needsUpdate = true; }
+  // Apply to both the backdrop material and the tile material (the visible surface near in).
+  for (const mat of [terrainMat, tileMat]) {
+    if (mat) { mat.wireframe = wireframeToggle.checked; mat.needsUpdate = true; }
+  }
 });
 
 gridToggle.addEventListener('change', () => {
@@ -430,6 +489,9 @@ gridSpacingSelect.addEventListener('change', () => {
 colorMapSelect.addEventListener('change', () => {
   currentColorMap = colorMapSelect.value;
   if (terrainMeshes.length > 0) applyVertexColors(terrainMeshes, currentColorMap);
+  // Recolour resident tiles against the (possibly updated) base range.
+  for (const m of detailTiles.values()) colorTileGeometry(m.geometry, currentColorMap);
+  for (const m of baseTiles.values())   colorTileGeometry(m.geometry, currentColorMap);
   // Keep the group cache in sync so the active LOD restores correct colors on re-visit
   const entry = lodGroupCache.get(activeLodUrl);
   if (entry) entry.colorMap = currentColorMap;
@@ -541,6 +603,219 @@ async function switchLod(url) {
   } finally {
     lodPending = false;
   }
+}
+
+// ── Detail-tile streaming ─────────────────────────────────────────────────────────
+/**
+ * Colour a tile geometry in-place using the active map and the BASE elevation
+ * range (so a flat tile doesn't span the whole palette). Mirrors pass 2 of
+ * applyVertexColors but with a fixed range instead of a per-mesh one.
+ * @param {THREE.BufferGeometry} geom
+ * @param {string} mapName
+ */
+function colorTileGeometry(geom, mapName) {
+  const isSlope  = mapName === 'slope';
+  const isAspect = mapName === 'aspect';
+  const fn    = COLOR_MAPS[mapName] ?? COLOR_MAPS.terrain;
+  const range = (baseYMax - baseYMin) || 1;
+  const pos = geom.attributes.position;
+  const nor = geom.attributes.normal;
+  const buf = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    let t;
+    if (isSlope) {
+      const ny = Math.max(-1, Math.min(1, nor.getY(i)));
+      t = Math.acos(ny) / (Math.PI / 2);
+    } else if (isAspect) {
+      const nx = nor.getX(i), nz = nor.getZ(i);
+      t = (Math.atan2(nx, -nz) + Math.PI) / (2 * Math.PI);
+    } else {
+      t = (pos.getY(i) - baseYMin) / range;
+    }
+    const [r, g, b] = fn(Math.max(0, Math.min(1, t)));
+    buf[i * 3] = r; buf[i * 3 + 1] = g; buf[i * 3 + 2] = b;
+  }
+  geom.setAttribute('color', new THREE.BufferAttribute(buf, 3));
+}
+
+/** Show "100 m overview" or "20 m ×N · 100 m ×M" in the LOD badge. */
+function setDetailBadge() {
+  const n = detailTiles.size + baseTiles.size;
+  setLodBadge(n === 0 ? '100 m overview' : `20 m ×${detailTiles.size} · 100 m ×${baseTiles.size}`, false);
+}
+
+/** @param {Map<string,THREE.Mesh>} map @param {THREE.Group} group @param {string} key */
+function disposeTile(map, group, key) {
+  const m = map.get(key);
+  if (!m) return;
+  group.remove(m);
+  m.geometry.dispose();
+  map.delete(key);
+}
+
+/**
+ * Load one tile at the given level. 'detail' = 20 m (tiles/), 'base' = 100 m (base_tiles/).
+ * @param {{key:string,url:string,cx:number,cz:number}} tile
+ * @param {'detail'|'base'} level
+ */
+function loadTile(tile, level) {
+  const isDetail = level === 'detail';
+  const map      = isDetail ? detailTiles  : baseTiles;
+  const loading  = isDetail ? detailLoading : baseLoading;
+  const group    = isDetail ? detailGroup  : baseTileGroup;
+  const url      = import.meta.env.BASE_URL + (isDetail ? tile.url : `base_tiles/${tile.key}.glb`);
+  loading.add(tile.key);
+  loader.load(
+    url,
+    (gltf) => {
+      loading.delete(tile.key);
+      let mesh = null;
+      gltf.scene.traverse((n) => { if (n.isMesh && !mesh) mesh = n; });
+      if (!mesh || !tileMat) return;
+      colorTileGeometry(mesh.geometry, currentColorMap);
+      const m = new THREE.Mesh(mesh.geometry, tileMat);
+      m.userData.cx = tile.cx;
+      m.userData.cz = tile.cz;
+      group.add(m);
+      map.set(tile.key, m);
+      setDetailBadge();
+    },
+    undefined,
+    () => { loading.delete(tile.key); },
+  );
+}
+
+/** Drop the farthest residents in `map` when over `cap`. */
+function capTiles(map, group, cap, cxw, czw) {
+  if (map.size <= cap) return;
+  const over = map.size - cap;  // capture before disposing (map.size shrinks below)
+  const byDist = [...map.entries()]
+    .map(([k, m]) => ({ k, d: Math.hypot(m.userData.cx - cxw, m.userData.cz - czw) }))
+    .sort((a, b) => b.d - a.d);
+  for (let i = 0; i < over; i++) disposeTile(map, group, byDist[i].k);
+}
+
+/**
+ * State-machine tiled LOD with hysteresis:
+ *   High (alt > FAR_ALT_EXIT)  → monolithic only, tiles disposed.
+ *   Buffer zone                → freeze current state (no transition).
+ *   Low (alt < FAR_ALT_ENTER)  → tile mode. Pre-warm: load 100 m tiles while keeping
+ *                                monolithic visible; switch when all frustum cells covered.
+ *   Moving camera              → all frustum tiles use 100 m (avoid 20 m churn).
+ *   Still camera               → near < DETAIL_DIST → 20 m, far → 100 m.
+ */
+function updateTiles() {
+  if (!tileIndex || !terrainBBox || !tileMat) return;
+
+  const alt = camera.position.y - terrainBBox.min.y;
+
+  // ── High-altitude exit ───────────────────────────────────────────────────────────
+  if (tilesModeActive && alt > FAR_ALT_EXIT) {
+    if (terrainGroup) terrainGroup.visible = true;
+    for (const k of [...detailTiles.keys()]) disposeTile(detailTiles, detailGroup, k);
+    for (const k of [...baseTiles.keys()])   disposeTile(baseTiles, baseTileGroup, k);
+    tilesModeActive = false;
+    setDetailBadge();
+    return;
+  }
+
+  // ── Monolithic mode: stay until below FAR_ALT_ENTER ─────────────────────────────
+  if (!tilesModeActive && alt >= FAR_ALT_ENTER) {
+    // Pure high-altitude: flush any stale tiles (e.g. if tileIndex was populated while high)
+    if (alt > FAR_ALT_EXIT) {
+      for (const k of [...detailTiles.keys()]) disposeTile(detailTiles, detailGroup, k);
+      for (const k of [...baseTiles.keys()])   disposeTile(baseTiles, baseTileGroup, k);
+      setDetailBadge();
+    }
+    return;
+  }
+
+  // ── Low-altitude: compute frustum-visible cells ──────────────────────────────────
+  const cxw = camera.position.x;
+  const czw = camera.position.z;
+  _detProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _detFrustum.setFromProjectionMatrix(_detProj);
+
+  const sy      = detailGroup.scale.y;
+  const midY    = (terrainBBox.min.y + terrainBBox.max.y) * 0.5 * sy;
+  const tileR   = (tileIndex.tileSize ?? 5000) * 0.75;
+  const sphereR = Math.max(tileR, (terrainBBox.max.y - terrainBBox.min.y) * sy * 0.5);
+
+  /** @type {{t: object, d: number}[]} */
+  const visible = [];
+  for (const t of tileIndex.tiles) {
+    _detSphere.center.set(t.cx, midY, t.cz);
+    _detSphere.radius = sphereR;
+    if (!_detFrustum.intersectsSphere(_detSphere)) continue;
+    visible.push({ t, d: Math.hypot(t.cx - cxw, t.cz - czw) });
+  }
+  visible.sort((a, b) => a.d - b.d);
+
+  // ── Pre-warm: load 100 m base tiles before hiding monolithic ─────────────────────
+  if (!tilesModeActive) {
+    for (const { t } of visible) {
+      if (baseTiles.has(t.key) || baseLoading.has(t.key)) continue;
+      if (baseLoading.size >= MAX_CONCURRENT) break;
+      if (baseTiles.size + baseLoading.size >= BASE_MAX) break;
+      loadTile(t, 'base');
+    }
+    // Switch only once every visible cell has a loaded base tile
+    if (visible.length > 0 && visible.every(({ t }) => baseTiles.has(t.key))) {
+      if (terrainGroup) terrainGroup.visible = false;
+      tilesModeActive = true;
+    }
+    setDetailBadge();
+    return;
+  }
+
+  // ── Tile mode: evictions ─────────────────────────────────────────────────────────
+  // 20 m: distance-based eviction
+  for (const [k, m] of detailTiles) {
+    if (Math.hypot(m.userData.cx - cxw, m.userData.cz - czw) > DETAIL_EVICT) {
+      disposeTile(detailTiles, detailGroup, k);
+    }
+  }
+  // 100 m: frustum-based eviction (out-of-frustum tiles freed; camera pan reloads them)
+  const visibleKeys = new Set(visible.map(({ t }) => t.key));
+  for (const k of [...baseTiles.keys()]) {
+    if (!visibleKeys.has(k)) disposeTile(baseTiles, baseTileGroup, k);
+  }
+  capTiles(detailTiles, detailGroup, DETAIL_MAX, cxw, czw);
+  capTiles(baseTiles, baseTileGroup, BASE_MAX, cxw, czw);
+
+  // ── Tile mode: loading ───────────────────────────────────────────────────────────
+  if (cameraMoving) {
+    // Moving: fill frustum with 100 m only; leave existing 20 m in place (avoid dispose/reload)
+    for (const { t } of visible) {
+      if (baseTiles.has(t.key) || baseLoading.has(t.key)) continue;
+      if (detailLoading.size + baseLoading.size >= MAX_CONCURRENT) break;
+      if (baseTiles.size + baseLoading.size >= BASE_MAX) break;
+      loadTile(t, 'base');
+    }
+  } else {
+    // Still: near → 20 m, far → 100 m
+    for (const { t, d } of visible) {
+      const hasDetail = detailTiles.has(t.key);
+      const wantsDetail = d < DETAIL_DIST || (hasDetail && d < DETAIL_DIST + LOD_HYST);
+      if (wantsDetail) {
+        if (baseTiles.has(t.key)) disposeTile(baseTiles, baseTileGroup, t.key);
+        if (!hasDetail && !detailLoading.has(t.key)) {
+          if (detailLoading.size < MAX_CONCURRENT && detailTiles.size + detailLoading.size < DETAIL_MAX) {
+            loadTile(t, 'detail');
+          }
+        }
+      } else {
+        if (hasDetail && d > DETAIL_EVICT) disposeTile(detailTiles, detailGroup, t.key);
+        if (!baseTiles.has(t.key) && !baseLoading.has(t.key)) {
+          if (detailLoading.size + baseLoading.size < MAX_CONCURRENT && baseTiles.size + baseLoading.size < BASE_MAX) {
+            loadTile(t, 'base');
+          }
+        }
+      }
+    }
+  }
+
+  setDetailBadge();
 }
 
 // ── Terrain chunking ─────────────────────────────────────────────────────────────
@@ -856,7 +1131,6 @@ loader.setDRACOLoader(dracoLoader);
         metalness: 0.0,
         side: THREE.FrontSide,
       });
-
       // Inject TWD97 grid overlay into the standard material's fragment shader.
       // Grid lines are computed from world-space XZ, which maps 1:1 to TWD97 metres
       // (GLB X = E - xCenter, GLB Z = -(N - yCenter)), so we undo the offset in-shader.
@@ -929,6 +1203,21 @@ loader.setDRACOLoader(dracoLoader);
       updateBoundaryY();
       activeLodUrl = GLB_URL;
       setLodBadge('100 m');
+
+      // Tile material shares the same shader patches (hillshade, grid) as terrainMat.
+      // Distinct cache key forces Three.js to compile its OWN program and re-run
+      // onBeforeCompile — reusing terrainMat's compiled program would skip the hook,
+      // leaving hillshade and the grid overlay dead on tiles.
+      tileMat = terrainMat.clone();
+      tileMat.customProgramCacheKey = () => 'terrain-grid-tile-v1';
+      detailGroup.scale.y   = userZScale;
+      baseTileGroup.scale.y = userZScale;
+      scene.add(detailGroup);
+      scene.add(baseTileGroup);
+      fetch(import.meta.env.BASE_URL + 'tiles/index.json')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d && d.tiles) tileIndex = d; })
+        .catch(() => { console.info('[tiles] tiles/index.json not found — run: just tile'); });
 
       progressFill.style.width = '100%';
       setTimeout(() => { loadingOverlay.hidden = true; }, 350);
@@ -1027,6 +1316,7 @@ let lastFrameTime = 0;
 
 (function animate(t) {
   requestAnimationFrame(animate);
+  stats.begin();
 
   const dt = Math.min((t - lastFrameTime) / 1000, 0.05);
   lastFrameTime = t;
@@ -1050,7 +1340,11 @@ let lastFrameTime = 0;
     if (target !== activeLodUrl) switchLod(target);
   }
 
+  // Tiled-LOD streaming: more frequent than LOD (camera focus moves continuously)
+  if (++detailFrameCount % 15 === 0 && introComplete) updateTiles();
+
   renderer.render(scene, camera);
+  stats.end();
 }(0));
 
 // ── Modal content ─────────────────────────────────────────────────────────────────
