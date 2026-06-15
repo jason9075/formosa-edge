@@ -26,6 +26,19 @@ convert-100m:
 convert-fast:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_40m.glb --step 2
 
+# Slice merged island into streamable tiles (two-level LOD) + draco-compress.
+# Both levels share taiwan_100m.glb's centre and the same 5 km grid keys, with +1-cell
+# overlap and skirts so the 20 m/100 m boundary has no cracks.
+#   output/tiles/      → 20 m detail tiles
+#   output/base_tiles/ → 100 m base tiles (step 5)
+tile:
+    @[ -d node_modules ] || npm install --ignore-scripts
+    python3 tile_dtm.py {{data_dir}} {{out_dir}}/tiles      --center-glb {{out_dir}}/taiwan_100m.glb --tile-size 5000 --skirt 120
+    python3 tile_dtm.py {{data_dir}} {{out_dir}}/base_tiles --center-glb {{out_dir}}/taiwan_100m.glb --tile-size 5000 --step 5 --skirt 120
+    @echo "Draco-compressing tiles…"
+    @ls {{out_dir}}/tiles/*.glb {{out_dir}}/base_tiles/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
+    @echo "Detail: $(ls {{out_dir}}/tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/tiles | cut -f1)  |  Base: $(ls {{out_dir}}/base_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/base_tiles | cut -f1)"
+
 # Single-county mesh at full 20 m (e.g. just convert-county taipei) → output/<slug>_20m.glb
 convert-county slug='taipei':
     python3 dtm_to_glb.py {{data_dir}}/{{slug}} {{out_dir}}/{{slug}}_20m.glb
@@ -92,6 +105,8 @@ stage:
     @for json in output/*.json; do \
         [ -f "$$json" ] && cp "$$json" "public/$$(basename $$json)" && echo "Staged $$json"; \
     done || true
+    @[ -d output/tiles ] && rm -rf public/tiles && cp -r output/tiles public/tiles && echo "Staged $$(ls public/tiles/*.glb | wc -l) detail tiles" || true
+    @[ -d output/base_tiles ] && rm -rf public/base_tiles && cp -r output/base_tiles public/base_tiles && echo "Staged $$(ls public/base_tiles/*.glb | wc -l) base tiles" || true
 
 # Start Vite dev server on :8080
 # GLB files are served from output/ transparently — run `just convert-fast` first

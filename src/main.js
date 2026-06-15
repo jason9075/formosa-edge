@@ -70,10 +70,20 @@ controls.dampingFactor  = 0.08;
 controls.zoomToCursor   = true;
 controls.screenSpacePanning = false;
 controls.enabled = false;  // disabled until terrain loads
-controls.addEventListener('change', () => {
+// Track user input, not camera position — OrbitControls damping fires 'change' every frame
+// after the user lets go, which would keep cameraMoving true for 1–2 s and block 20 m loading.
+renderer.domElement.addEventListener('pointerdown', () => {
   cameraMoving = true;
   clearTimeout(movingTimer);
+});
+renderer.domElement.addEventListener('pointerup', () => {
+  clearTimeout(movingTimer);
   movingTimer = setTimeout(() => { cameraMoving = false; }, 300);
+});
+renderer.domElement.addEventListener('wheel', () => {
+  cameraMoving = true;
+  clearTimeout(movingTimer);
+  movingTimer = setTimeout(() => { cameraMoving = false; }, 500);
 });
 
 // ── Lighting (from NW at 45°; X=East, Y=Up, Z=South in GLB) ────────────────────
@@ -676,6 +686,10 @@ function loadTile(tile, level) {
       const m = new THREE.Mesh(mesh.geometry, tileMat);
       m.userData.cx = tile.cx;
       m.userData.cz = tile.cz;
+      // Dispose the 100 m tile BEFORE adding the 20 m tile to avoid one-frame Z-fighting.
+      // Keeping 100 m visible while 20 m loaded prevents the black gap that would occur if
+      // 100 m were disposed eagerly (before the async load finished).
+      if (isDetail && baseTiles.has(tile.key)) disposeTile(baseTiles, baseTileGroup, tile.key);
       group.add(m);
       map.set(tile.key, m);
       setDetailBadge();
@@ -785,20 +799,24 @@ function updateTiles() {
 
   // ── Tile mode: loading ───────────────────────────────────────────────────────────
   if (cameraMoving) {
-    // Moving: fill frustum with 100 m only; leave existing 20 m in place (avoid dispose/reload)
-    for (const { t } of visible) {
+    // Moving: only load near 100 m tiles (within DETAIL_DIST); far tiles not worth the churn.
+    // Skip cells that already have a 20 m tile (loaded or loading) — no need for a 100 m fallback.
+    for (const { t, d } of visible) {
+      if (d >= DETAIL_DIST) break;  // visible is sorted nearest-first
       if (baseTiles.has(t.key) || baseLoading.has(t.key)) continue;
+      if (detailTiles.has(t.key) || detailLoading.has(t.key)) continue;
       if (detailLoading.size + baseLoading.size >= MAX_CONCURRENT) break;
       if (baseTiles.size + baseLoading.size >= BASE_MAX) break;
       loadTile(t, 'base');
     }
   } else {
-    // Still: near → 20 m, far → 100 m
+    // Still: near → 20 m, far → 100 m.
+    // Do NOT dispose 100 m here — loadTile's callback disposes it once 20 m is ready,
+    // so 100 m stays visible as a placeholder during the async load (no black gap).
     for (const { t, d } of visible) {
       const hasDetail = detailTiles.has(t.key);
       const wantsDetail = d < DETAIL_DIST || (hasDetail && d < DETAIL_DIST + LOD_HYST);
       if (wantsDetail) {
-        if (baseTiles.has(t.key)) disposeTile(baseTiles, baseTileGroup, t.key);
         if (!hasDetail && !detailLoading.has(t.key)) {
           if (detailLoading.size < MAX_CONCURRENT && detailTiles.size + detailLoading.size < DETAIL_MAX) {
             loadTile(t, 'detail');
