@@ -1319,6 +1319,20 @@ loader.setDRACOLoader(dracoLoader);
         .then((d) => { if (d && d.tiles) { tileIndex = d; buildTileSpatialIndex(); } })
         .catch(() => { console.info('[tiles] tiles/index.json not found — run: just tile'); });
 
+      // ── PoC: load white building massing (region 3357) for alignment check ──
+      // TEMPORARY — remove once the building tile pipeline + streaming lands.
+      {
+        const buildingMat = new THREE.MeshStandardMaterial({
+          color: 0xffffff, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
+        });
+        loader.load(import.meta.env.BASE_URL + 'buildings_poc.glb', (gltf) => {
+          gltf.scene.traverse((n) => { if (n.isMesh) n.material = buildingMat; });
+          gltf.scene.scale.y = userZScale;
+          scene.add(gltf.scene);
+          console.info('[poc] buildings_poc.glb loaded');
+        }, undefined, () => console.info('[poc] buildings_poc.glb not found'));
+      }
+
       // Skip intro animation — jump straight to the initial Taipei viewpoint.
       cameraReset();
       controls.enabled = true;
