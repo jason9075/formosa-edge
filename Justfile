@@ -48,6 +48,22 @@ buildings:
     @ls {{out_dir}}/building_tiles/*.glb {{out_dir}}/building_boxes/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
     @echo "Massing: $(ls {{out_dir}}/building_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/building_tiles | cut -f1)  |  Box: $(du -sh {{out_dir}}/building_boxes | cut -f1)"
 
+# PoC: river-area polygons (type 1–4) → single flat water-surface GLB, clipped to
+# the given DTM extent (default raw/taipei) and clamped onto the 20 m terrain.
+rivers-poc dtm='raw/taipei':
+    python3 rivers_to_glb.py "raw/river/riverpoly/riverpoly.shp" {{out_dir}}/rivers_poc.glb --dtm {{dtm}} --center-glb {{out_dir}}/taiwan_100m.glb --types 1 2 3 4
+
+# Whole-island river channels (type 1–4) → 5 km flat water-surface tiles + draco.
+# Polygons are clipped to tile boundaries (no centroid-bin gaps) and clamped onto
+# the 100 m DTM (--dtm-step 5 — water level is coarse; a 20 m island grid is too heavy).
+# Shares the 5 km grid keys with terrain/buildings; streamed by updateRivers().
+rivers:
+    @[ -d node_modules ] || npm install --ignore-scripts
+    python3 rivers_to_glb.py "raw/river/riverpoly/riverpoly.shp" {{out_dir}}/river_tiles --dtm {{data_dir}} --center-glb {{out_dir}}/taiwan_100m.glb --types 1 2 3 4 --tiled --dtm-step 5
+    @echo "Draco-compressing river tiles…"
+    @ls {{out_dir}}/river_tiles/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
+    @echo "Rivers: $(ls {{out_dir}}/river_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/river_tiles | cut -f1)"
+
 # Single-county mesh at full 20 m (e.g. just convert-county taipei) → output/<slug>_20m.glb
 convert-county slug='taipei':
     python3 dtm_to_glb.py {{data_dir}}/{{slug}} {{out_dir}}/{{slug}}_20m.glb

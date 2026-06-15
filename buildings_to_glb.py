@@ -53,10 +53,10 @@ def center_from_glb(glb_path: Path) -> tuple[float, float]:
 class TerrainSampler:
     """Nearest-neighbour 20 m DTM elevation lookup in TWD97 (E, N)."""
 
-    def __init__(self, dtm_dir: Path):
+    def __init__(self, dtm_dir: Path, step: int = 1):
         pts, spacing = load_tiles(dtm_dir)
-        self.x_grid, self.y_grid, self.Z = build_grid(pts, spacing, step=1)
-        self.spacing = spacing
+        self.x_grid, self.y_grid, self.Z = build_grid(pts, spacing, step=step)
+        self.spacing = spacing * step
         self.x0, self.y0 = float(self.x_grid[0]), float(self.y_grid[0])
         self.rows, self.cols = self.Z.shape
         self._fallback = float(np.nanmin(self.Z))

@@ -2,6 +2,11 @@ import * as THREE from 'three';
 import { GLTFLoader }    from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader }   from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { Line2 }                from 'three/examples/jsm/lines/Line2.js';
+import { LineSegments2 }        from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineGeometry }         from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial }         from 'three/examples/jsm/lines/LineMaterial.js';
 import renderMathInElement from 'katex/dist/contrib/auto-render';
 import createStats from './stats.js';
 import 'katex/dist/katex.min.css';
@@ -31,8 +36,9 @@ const roadsHighwayToggle   = /** @type {HTMLInputElement} */ (document.getElemen
 const roadsExpresswayToggle= /** @type {HTMLInputElement} */ (document.getElementById('roads-expressway'));
 const roadsProvincialToggle= /** @type {HTMLInputElement} */ (document.getElementById('roads-provincial'));
 const boundariesToggle     = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
-const hillshadeToggle      = /** @type {HTMLInputElement} */ (document.getElementById('hillshade-toggle'));
+const shaderToggle         = /** @type {HTMLInputElement} */ (document.getElementById('shader-toggle'));
 const buildingsToggle      = /** @type {HTMLInputElement} */ (document.getElementById('buildings-toggle'));
+const riversToggle         = /** @type {HTMLInputElement} */ (document.getElementById('rivers-toggle'));
 const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
@@ -320,6 +326,18 @@ const _detSphere  = new THREE.Sphere();
 const BUILDING_FAR    = 12000; // alt (m above terrain) above this → unload all buildings
 const BUILDING_DETAIL = 4000;  // tile within this of camera → massing, else box
 const buildingGroup = new THREE.Group();
+// Rivers: flat blue water-surface tiles (river_tiles/), streamed by updateRivers().
+// Single representation (no LOD) — water is flat, far cheaper than buildings.
+const RIVER_FAR = 80000; // alt (m above terrain) above this → unload all river tiles
+const riverGroup = new THREE.Group();
+/** @type {{tileSize:number, tiles:{key:string,cx:number,cz:number}[]}|null} */
+let riverIndex = null;
+/** @type {Map<string, THREE.Mesh>} */ const riverTiles = new Map();
+const riverLoading = new Set();
+// Mirror's Edge water — light blue, slight sheen; receives building/terrain shadows.
+const riverMat = new THREE.MeshStandardMaterial({
+  color: 0x4a90d9, roughness: 0.25, metalness: 0.0, side: THREE.DoubleSide,
+});
 /** @type {{tileSize:number, tiles:{key:string,cx:number,cz:number}[]}|null} */
 let buildingIndex = null;
 /** @type {Map<string, THREE.Mesh>} */ const buildingMassing = new Map();
@@ -347,10 +365,22 @@ setPanelOpen(panelOpen);
 panelToggleBtn.addEventListener('click', () => setPanelOpen(!panelOpen));
 
 // ── Resize ───────────────────────────────────────────────────────────────────────
+// Fat-line (Line2/LineSegments2) materials need the viewport resolution to size
+// their pixel-space linewidth; keep a registry so resize() refreshes them all.
+/** @type {LineMaterial[]} */
+const fatLineMaterials = [];
+function makeFatLineMaterial(color, linewidth, opacity) {
+  const m = new LineMaterial({ color, linewidth, transparent: true, opacity });
+  m.resolution.set(window.innerWidth, window.innerHeight);
+  fatLineMaterials.push(m);
+  return m;
+}
+
 function resize() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+  for (const m of fatLineMaterials) m.resolution.set(window.innerWidth, window.innerHeight);
 }
 window.addEventListener('resize', resize);
 resize();
@@ -545,6 +575,7 @@ zScaleSlider.addEventListener('input', () => {
   detailGroup.scale.y = userZScale;
   baseTileGroup.scale.y = userZScale;
   buildingGroup.scale.y = userZScale;
+  riverGroup.scale.y = userZScale;
   updateRoadY();
   updateBoundaryY();
 });
@@ -1006,6 +1037,64 @@ function updateBuildings() {
   for (const k of [...buildingBoxes.keys()])   if (!visibleKeys.has(k)) disposeBuilding(buildingBoxes, k);
 }
 
+// ── River streaming ────────────────────────────────────────────────────────────────
+function disposeRiver(key) {
+  const m = riverTiles.get(key);
+  if (!m) return;
+  riverGroup.remove(m);
+  m.geometry.dispose();
+  riverTiles.delete(key);
+}
+
+/** @param {{key:string,cx:number,cz:number}} tile */
+function loadRiver(tile) {
+  riverLoading.add(tile.key);
+  loader.load(
+    `${import.meta.env.BASE_URL}river_tiles/${tile.key}.glb`,
+    (gltf) => {
+      riverLoading.delete(tile.key);
+      let mesh = null;
+      gltf.scene.traverse((n) => { if (n.isMesh && !mesh) mesh = n; });
+      if (!mesh) return;
+      const m = new THREE.Mesh(mesh.geometry, riverMat);
+      m.receiveShadow = true; // water catches building/terrain shadows
+      riverGroup.add(m);
+      riverTiles.set(tile.key, m);
+    },
+    undefined,
+    () => { riverLoading.delete(tile.key); },
+  );
+}
+
+/** Stream flat water tiles — frustum-culled, altitude-gated. Single LOD. */
+function updateRivers() {
+  if (!riverIndex || !terrainBBox) return;
+
+  const alt = camera.position.y - terrainBBox.min.y;
+  if (!riversToggle.checked || alt > RIVER_FAR) {
+    for (const k of [...riverTiles.keys()]) disposeRiver(k);
+    return;
+  }
+
+  _detProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _detFrustum.setFromProjectionMatrix(_detProj);
+
+  const sy = riverGroup.scale.y;
+  const midY = (terrainBBox.min.y + terrainBBox.max.y) * 0.5 * sy;
+  const tileR = (riverIndex.tileSize ?? 5000) * 0.75;
+
+  const visibleKeys = new Set();
+  for (const t of riverIndex.tiles) {
+    _detSphere.center.set(t.cx, midY, t.cz);
+    _detSphere.radius = tileR;
+    if (!_detFrustum.intersectsSphere(_detSphere)) continue;
+    visibleKeys.add(t.key);
+    if (!riverTiles.has(t.key) && !riverLoading.has(t.key)) loadRiver(t);
+  }
+
+  for (const k of [...riverTiles.keys()]) if (!visibleKeys.has(k)) disposeRiver(k);
+}
+
 // ── Terrain chunking ─────────────────────────────────────────────────────────────
 // Split a single BufferGeometry into CHUNK_R × CHUNK_C sub-meshes so Three.js
 // frustum culling can discard off-screen chunks individually.
@@ -1256,10 +1345,10 @@ function sampleTerrainHeight(x, z) {
 // ── Road overlay ─────────────────────────────────────────────────────────────────
 /** @type {THREE.Group|null} */
 let roadGroup = null;
-/** @type {Map<string, THREE.LineSegments>} */
+/** @type {Map<string, LineSegments2>} */
 const roadLayers = new Map();
 // Roads float ROAD_LIFT world-metres above terrain; scale.y tracks userZScale.
-const ROAD_LIFT = 80;
+const ROAD_LIFT = 20;
 
 /**
  * After terrain height grid is ready, bake per-vertex elevation into road buffers.
@@ -1268,12 +1357,15 @@ const ROAD_LIFT = 80;
  */
 function applyRoadElevations() {
   if (!terrainHeightGrid || roadLayers.size === 0) return;
-  for (const [, seg] of roadLayers) {
-    const pos = seg.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      pos.setY(i, sampleTerrainHeight(pos.getX(i), pos.getZ(i)));
+  for (const [, line] of roadLayers) {
+    const { flat, positions } = line.userData;
+    const edgeCount = flat.length / 4;
+    for (let i = 0; i < edgeCount; i++) {
+      const fi = i * 4, pi = i * 6;
+      positions[pi + 1] = sampleTerrainHeight(flat[fi], flat[fi + 1]);
+      positions[pi + 4] = sampleTerrainHeight(flat[fi + 2], flat[fi + 3]);
     }
-    pos.needsUpdate = true;
+    line.geometry.setPositions(positions); // rebuilds the instanced segment attributes
   }
 }
 
@@ -1293,11 +1385,11 @@ function buildRoadGroup(data) {
   const group = new THREE.Group();
   roadLayers.clear();
   const classes = [
-    { key: 'highway',    color: 0xff5522, opacity: 0.95 },
-    { key: 'expressway', color: 0x88bbff, opacity: 0.90 },
-    { key: 'provincial', color: 0x66ccaa, opacity: 0.85 },
+    { key: 'highway',    color: 0xff5522, width: 3.0, opacity: 0.95 },
+    { key: 'expressway', color: 0xffcc00, width: 3.0, opacity: 0.95 }, // gold
+    { key: 'provincial', color: 0x66ccaa, width: 3.0, opacity: 0.90 },
   ];
-  for (const { key, color, opacity } of classes) {
+  for (const { key, color, width, opacity } of classes) {
     const flat = data[key];
     if (!flat || flat.length < 4) continue;
     const edgeCount = flat.length / 4;
@@ -1308,11 +1400,14 @@ function buildRoadGroup(data) {
       positions[pi]   = x0; positions[pi+1] = sampleTerrainHeight(x0, z0); positions[pi+2] = z0;
       positions[pi+3] = x1; positions[pi+4] = sampleTerrainHeight(x1, z1); positions[pi+5] = z1;
     }
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const seg = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color, transparent: true, opacity }));
-    roadLayers.set(key, seg);
-    group.add(seg);
+    const geom = new LineSegmentsGeometry();
+    geom.setPositions(positions);
+    const line = new LineSegments2(geom, makeFatLineMaterial(color, width, opacity));
+    line.frustumCulled = false; // dynamic Y + island-wide bounds; cheap, avoids mis-cull
+    line.userData.flat = flat;            // raw XZ edge pairs, for elevation rebake
+    line.userData.positions = positions;  // reused buffer for setPositions on rebake
+    roadLayers.set(key, line);
+    group.add(line);
   }
   return group;
 }
@@ -1341,11 +1436,7 @@ roadsExpresswayToggle.addEventListener('change', () => setRoadLayerVisible('expr
 roadsProvincialToggle.addEventListener('change', () => setRoadLayerVisible('provincial', roadsProvincialToggle.checked));
 
 // ── Admin boundary overlay ───────────────────────────────────────────────────────
-const boundaryMat = new THREE.LineBasicMaterial({
-  color: 0xffe566,
-  transparent: true,
-  opacity: 0.75,
-});
+const boundaryMat = makeFatLineMaterial(0xffffff, 4.5, 0.9); // white, thicker than roads
 
 /**
  * Lift boundary group so it hovers just above the highest terrain point in world space.
@@ -1368,15 +1459,20 @@ function buildBoundaryGroup(rings) {
   const group = new THREE.Group();
   for (const ring of rings) {
     if (ring.length < 2) continue;
-    const positions = new Float32Array(ring.length * 3);
-    for (let i = 0; i < ring.length; i++) {
+    const n = ring.length;
+    const positions = new Float32Array((n + 1) * 3); // +1 repeats the first vertex (Line2 has no LineLoop)
+    for (let i = 0; i < n; i++) {
       positions[i * 3]     = ring[i][0];
       positions[i * 3 + 1] = 0;
       positions[i * 3 + 2] = ring[i][1];
     }
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    group.add(new THREE.LineLoop(geom, boundaryMat));
+    positions[n * 3] = ring[0][0];
+    positions[n * 3 + 2] = ring[0][1];
+    const geom = new LineGeometry();
+    geom.setPositions(positions);
+    const line = new Line2(geom, boundaryMat);
+    line.frustumCulled = false;
+    group.add(line);
   }
   return group;
 }
@@ -1402,12 +1498,24 @@ boundariesToggle.addEventListener('change', () => {
   if (boundaryGroup) boundaryGroup.visible = boundariesToggle.checked;
 });
 
-hillshadeToggle.addEventListener('change', () => {
-  sunUniforms.uHillshade.value = hillshadeToggle.checked ? 1.0 : 0.0;
-});
+// One "Shader" switch: terrain hillshade + cast shadows (terrain & buildings).
+// Toggling dirLight.castShadow changes the shadow-caster count, so three.js
+// recompiles the affected materials automatically (no manual needsUpdate).
+function applyShader() {
+  const on = shaderToggle.checked;
+  sunUniforms.uHillshade.value = on ? 1.0 : 0.0;
+  dirLight.castShadow = on;
+}
+shaderToggle.addEventListener('change', applyShader);
+applyShader(); // sync from the default-checked state
 
 buildingsToggle.addEventListener('change', () => {
   buildingGroup.visible = buildingsToggle.checked;
+});
+
+riversToggle.addEventListener('change', () => {
+  riverGroup.visible = riversToggle.checked;
+  if (!riversToggle.checked) updateRivers(); // unload tiles to free memory
 });
 
 timeSlider.addEventListener('input', () => {
@@ -1555,6 +1663,15 @@ loader.setDRACOLoader(dracoLoader);
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => { if (d && d.tiles) buildingIndex = d; })
         .catch(() => { console.info('[buildings] building_tiles/index.json not found — run: just buildings'); });
+
+      // River water tiles: flat blue surface clamped to terrain, streamed by updateRivers().
+      riverGroup.scale.y = userZScale;
+      riverGroup.visible = riversToggle.checked;
+      scene.add(riverGroup);
+      fetch(import.meta.env.BASE_URL + 'river_tiles/index.json')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d && d.tiles) riverIndex = d; })
+        .catch(() => { console.info('[rivers] river_tiles/index.json not found — run: just rivers'); });
 
       // Skip intro animation — jump straight to the initial Taipei viewpoint.
       cameraReset();
@@ -1743,7 +1860,7 @@ let lastFrameTime = 0;
 
   // Tiled-LOD streaming: more frequent than LOD (camera focus moves continuously)
   if (++detailFrameCount % 15 === 0 && introComplete) updateTiles();
-  if (++buildingFrameCount % 20 === 0 && introComplete) updateBuildings();
+  if (++buildingFrameCount % 20 === 0 && introComplete) { updateBuildings(); updateRivers(); }
 
   renderer.render(scene, camera);
   renderGizmo();

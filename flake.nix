@@ -15,6 +15,8 @@
           ps.numpy
           ps.pyshp
           ps.pyproj
+          ps.shapely        # polygon ring/hole classification + vertex simplification
+          ps.mapbox-earcut  # robust polygon triangulation (handles holes)
         ]);
       in
       {

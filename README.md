@@ -20,6 +20,7 @@ overlay, administrative boundary lines, and a road network overlay.
 | Township / district boundaries | Shapefile (polygon) | GCS TWD97 geographic (degrees) | [data.gov.tw/dataset/7441](https://data.gov.tw/dataset/7441) |
 | National / provincial road centrelines (incl. expressways) | Shapefile (polyline) | TWD97 TM2 (EPSG:3826) | [data.gov.tw/dataset/73232](https://data.gov.tw/dataset/73232) |
 | Taipei City 3D buildings | KMZ (COLLADA models) | WGS84 lon/lat → TWD97 | [github.com/sheethub/tpe3d](https://github.com/sheethub/tpe3d) |
+| River channels (河川河道) | Shapefile (polygon) | TWD97 TM2 (EPSG:3826) | [data.gov.tw/dataset/25781](https://data.gov.tw/dataset/25781) |
 
 ---
 
