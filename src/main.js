@@ -69,6 +69,11 @@ controls.enableDamping  = true;
 controls.dampingFactor  = 0.08;
 controls.zoomToCursor   = true;
 controls.screenSpacePanning = false;
+controls.mouseButtons = {
+  LEFT:   THREE.MOUSE.PAN,
+  MIDDLE: THREE.MOUSE.ROTATE,
+  RIGHT:  THREE.MOUSE.DOLLY,
+};
 controls.enabled = false;  // disabled until terrain loads
 // Track user input, not camera position — OrbitControls damping fires 'change' every frame
 // after the user lets go, which would keep cameraMoving true for 1–2 s and block 20 m loading.
@@ -1222,11 +1227,13 @@ loader.setDRACOLoader(dracoLoader);
       activeLodUrl = GLB_URL;
       setLodBadge('100 m');
 
-      // Tile material shares the same shader patches (hillshade, grid) as terrainMat.
-      // Distinct cache key forces Three.js to compile its OWN program and re-run
-      // onBeforeCompile — reusing terrainMat's compiled program would skip the hook,
-      // leaving hillshade and the grid overlay dead on tiles.
+      // Material.copy() in Three.js r163 does NOT copy onBeforeCompile — it only
+      // transfers primitive properties. We must copy the hook explicitly so tiles
+      // get the same hillshade + grid shader injection as the backdrop.
+      // The distinct customProgramCacheKey prevents Three.js from reusing the
+      // backdrop's already-compiled program, which would skip the hook entirely.
       tileMat = terrainMat.clone();
+      tileMat.onBeforeCompile = terrainMat.onBeforeCompile;
       tileMat.customProgramCacheKey = () => 'terrain-grid-tile-v1';
       detailGroup.scale.y   = userZScale;
       baseTileGroup.scale.y = userZScale;
