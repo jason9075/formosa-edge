@@ -284,7 +284,30 @@ def place_building(pos_local, lon, lat, heading, scale, sampler, x_center, y_cen
     gx = e_world - x_center
     gy = elev + (base_y - foundation)
     gz = -(n_world - y_center)
-    return np.stack([gx, gy, gz], axis=-1).astype(np.float32)
+    world = np.stack([gx, gy, gz], axis=-1).astype(np.float32)
+    return world, float(e_loc), float(n_loc)
+
+
+def building_box(world_pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Axis-aligned bounding box of a placed building → 8 verts + 12 triangles.
+
+    The far-LOD "simple square": footprint AABB (in GLB x/z) extruded from the
+    building base (min y) to its roof (max y)."""
+    x0, y0, z0 = world_pos.min(axis=0)
+    x1, y1, z1 = world_pos.max(axis=0)
+    v = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],  # base 0..3
+        [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],  # roof 4..7
+    ], dtype=np.float32)
+    f = np.array([
+        [0, 2, 1], [0, 3, 2],            # bottom
+        [4, 5, 6], [4, 6, 7],            # top
+        [0, 1, 5], [0, 5, 4],            # -z wall
+        [1, 2, 6], [1, 6, 5],            # +x wall
+        [2, 3, 7], [2, 7, 6],            # +z wall
+        [3, 0, 4], [3, 4, 7],            # -x wall
+    ], dtype=np.uint32)
+    return v, f
 
 
 # ── Flat-shaded normals + GLB writer ────────────────────────────────────────────────
@@ -346,12 +369,52 @@ def write_mesh_glb(positions, normals, faces, x_center, y_center, out_path: Path
     print(f'  Vertices: {len(positions):,}  |  Triangles: {faces.size // 3:,}')
 
 
+TILE = 5000  # metres — match tile_dtm.py grid
+
+
+def collect_buildings(src_dir: Path, sampler, x_center, y_center, foundation, mode):
+    """Parse every KMZ under src_dir → list of (verts, faces, e_loc, n_loc) per building.
+
+    mode='massing' keeps source geometry; mode='box' emits each building's AABB."""
+    kmzs = sorted(src_dir.rglob('*_r*.kmz'))
+    print(f'=== Processing {len(kmzs)} KMZ under {src_dir} (mode={mode}) ===')
+    out, n_skipped = [], 0
+    for kmz in kmzs:
+        try:
+            for pos_local, faces, lon, lat, heading, scale, _ in parse_kmz(kmz):
+                world, e_loc, n_loc = place_building(
+                    pos_local, lon, lat, heading, scale, sampler, x_center, y_center, foundation)
+                if mode == 'box':
+                    world, faces = building_box(world)
+                out.append((world, faces, e_loc, n_loc))
+        except Exception as exc:  # noqa: BLE001 — robust batch processing
+            print(f'  [warn] {kmz.name}: {exc}', file=sys.stderr)
+            n_skipped += 1
+    print(f'Parsed {len(out):,} buildings ({n_skipped} KMZ skipped)')
+    return out
+
+
+def _merge_write(pieces, x_center, y_center, out_path):
+    """Merge (verts, faces) pieces, flat-shade, write one GLB."""
+    all_pos, all_faces, vbase = [], [], 0
+    for verts, faces in pieces:
+        all_pos.append(verts)
+        all_faces.append(faces + vbase)
+        vbase += len(verts)
+    positions = np.concatenate(all_pos, axis=0)
+    faces = np.concatenate(all_faces, axis=0).astype(np.uint32)
+    fpos, fnor, fidx = flat_mesh(positions, faces)
+    write_mesh_glb(fpos, fnor, fidx, x_center, y_center, out_path)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('region_dir', type=Path, help='Region dir e.g. raw/buildings/kmzs/3357')
-    ap.add_argument('output', type=Path, help='Output .glb')
+    ap.add_argument('src_dir', type=Path, help='KMZ dir (region e.g. raw/buildings/kmzs/3357, or kmzs root)')
+    ap.add_argument('output', type=Path, help='Output .glb (single) or dir (--tiled)')
     ap.add_argument('--dtm', type=Path, required=True, help='20 m DTM dir (raw/taipei)')
     ap.add_argument('--center-glb', type=Path, required=True, help='Reference GLB for x/y_center')
+    ap.add_argument('--mode', choices=['massing', 'box'], default='massing')
+    ap.add_argument('--tiled', action='store_true', help='Slice into 5 km tiles + index.json')
     ap.add_argument('--foundation', type=float, default=0.0, metavar='M', help='Sink base below terrain')
     args = ap.parse_args()
 
@@ -361,38 +424,37 @@ def main() -> None:
     print('\n=== Building terrain sampler (20 m DTM) ===')
     sampler = TerrainSampler(args.dtm)
 
-    kmzs = sorted(args.region_dir.glob('*_r*.kmz'))
-    print(f'\n=== Processing {len(kmzs)} KMZ in {args.region_dir.name} ===')
-
-    all_pos: list[np.ndarray] = []
-    all_faces: list[np.ndarray] = []
-    vbase = 0
-    n_buildings = n_skipped = 0
-
-    for kmz in kmzs:
-        try:
-            for pos_local, faces, lon, lat, heading, scale, _ in parse_kmz(kmz):
-                world = place_building(pos_local, lon, lat, heading, scale,
-                                       sampler, x_center, y_center, args.foundation)
-                all_pos.append(world)
-                all_faces.append(faces + vbase)
-                vbase += len(world)
-                n_buildings += 1
-        except Exception as exc:  # noqa: BLE001 — robust batch processing
-            print(f'  [warn] {kmz.name}: {exc}', file=sys.stderr)
-            n_skipped += 1
-
-    if not all_pos:
+    print()
+    buildings = collect_buildings(args.src_dir, sampler, x_center, y_center, args.foundation, args.mode)
+    if not buildings:
         sys.exit('No buildings parsed.')
 
-    print(f'\nParsed {n_buildings:,} buildings ({n_skipped} KMZ skipped)')
-    positions = np.concatenate(all_pos, axis=0)
-    faces = np.concatenate(all_faces, axis=0).astype(np.uint32)
+    if not args.tiled:
+        print('\n=== Flat-shading + writing single GLB ===')
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        _merge_write([(v, f) for v, f, _, _ in buildings], x_center, y_center, args.output)
+        return
 
-    print('=== Flat-shading + writing GLB ===')
-    fpos, fnor, fidx = flat_mesh(positions, faces)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_mesh_glb(fpos, fnor, fidx, x_center, y_center, args.output)
+    # Tiled: bin each building into a 5 km TWD97 cell (centroid → tile).
+    print(f'\n=== Slicing into {TILE} m tiles → {args.output} ===')
+    args.output.mkdir(parents=True, exist_ok=True)
+    groups: dict[str, list] = {}
+    for verts, faces, e_loc, n_loc in buildings:
+        ti, tj = int(e_loc // TILE), int(n_loc // TILE)
+        groups.setdefault(f'{ti}_{tj}', []).append((verts, faces))
+
+    index_tiles = []
+    for key, pieces in sorted(groups.items()):
+        _merge_write(pieces, x_center, y_center, args.output / f'{key}.glb')
+        ti, tj = (int(p) for p in key.split('_'))
+        cx = (ti + 0.5) * TILE - x_center
+        cz = -((tj + 0.5) * TILE - y_center)
+        index_tiles.append({'key': key, 'url': f'{args.output.name}/{key}.glb',
+                            'cx': round(cx, 1), 'cz': round(cz, 1)})
+
+    index = {'center': [round(x_center, 2), round(y_center, 2)], 'tileSize': TILE, 'tiles': index_tiles}
+    (args.output / 'index.json').write_text(json.dumps(index, separators=(',', ':')))
+    print(f'\nWrote {len(index_tiles)} tiles + index.json to {args.output}')
 
 
 if __name__ == '__main__':

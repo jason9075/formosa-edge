@@ -36,6 +36,18 @@ tile:
     @ls {{out_dir}}/tiles/*.glb {{out_dir}}/base_tiles/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
     @echo "Detail: $(ls {{out_dir}}/tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/tiles | cut -f1)  |  Base: $(ls {{out_dir}}/base_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/base_tiles | cut -f1)"
 
+# Convert Taipei 3D building KMZ → white massing + box-LOD tiles + draco.
+# Two representations share the 5 km grid keys: building_tiles/ (source massing) and
+# building_boxes/ (per-building AABB, the far-LOD "simple squares"). Buildings clamp
+# onto the raw 20 m DTM (raw/taipei).
+buildings:
+    @[ -d node_modules ] || npm install --ignore-scripts
+    python3 buildings_to_glb.py {{data_dir}}/buildings/kmzs {{out_dir}}/building_tiles --dtm {{data_dir}}/taipei --center-glb {{out_dir}}/taiwan_100m.glb --mode massing --tiled
+    python3 buildings_to_glb.py {{data_dir}}/buildings/kmzs {{out_dir}}/building_boxes --dtm {{data_dir}}/taipei --center-glb {{out_dir}}/taiwan_100m.glb --mode box --tiled
+    @echo "Draco-compressing building tiles…"
+    @ls {{out_dir}}/building_tiles/*.glb {{out_dir}}/building_boxes/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
+    @echo "Massing: $(ls {{out_dir}}/building_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/building_tiles | cut -f1)  |  Box: $(du -sh {{out_dir}}/building_boxes | cut -f1)"
+
 # Single-county mesh at full 20 m (e.g. just convert-county taipei) → output/<slug>_20m.glb
 convert-county slug='taipei':
     python3 dtm_to_glb.py {{data_dir}}/{{slug}} {{out_dir}}/{{slug}}_20m.glb

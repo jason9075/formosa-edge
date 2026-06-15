@@ -19,6 +19,7 @@ overlay, administrative boundary lines, and a road network overlay.
 | Taiwan 20 m DTM (2025 edition) | GRD / HDR tiles | TWD97 TM2 (EPSG:3826), TWVD2001 vertical | [data.gov.tw/dataset/176927](https://data.gov.tw/dataset/176927) |
 | Township / district boundaries | Shapefile (polygon) | GCS TWD97 geographic (degrees) | [data.gov.tw/dataset/7441](https://data.gov.tw/dataset/7441) |
 | National / provincial road centrelines (incl. expressways) | Shapefile (polyline) | TWD97 TM2 (EPSG:3826) | [data.gov.tw/dataset/73232](https://data.gov.tw/dataset/73232) |
+| Taipei City 3D buildings | KMZ (COLLADA models) | WGS84 lon/lat → TWD97 | [github.com/sheethub/tpe3d](https://github.com/sheethub/tpe3d) |
 
 ---
 
@@ -384,3 +385,4 @@ Source code: MIT.
 Terrain data: [CC BY 4.0](https://data.gov.tw/dataset/176927) — 國土測繪中心, 內政部.
 Boundary data: [CC BY 4.0](https://data.gov.tw/dataset/7441) — 內政部國土管理署.
 Road data: [CC BY 4.0](https://data.gov.tw/dataset/73232) — 內政部國土管理署.
+3D building data: [tpe3d](https://github.com/sheethub/tpe3d) — 臺北市政府都市發展局 (台北市開放資料).

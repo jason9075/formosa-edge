@@ -18,6 +18,8 @@ const resetCameraBtn  = document.getElementById('reset-camera');
 const topViewBtn      = document.getElementById('top-view');
 const zScaleSlider    = /** @type {HTMLInputElement}  */ (document.getElementById('z-scale'));
 const zScaleValue     = document.getElementById('z-scale-value');
+const timeSlider      = /** @type {HTMLInputElement}  */ (document.getElementById('time-of-day'));
+const timeValue       = document.getElementById('time-value');
 const wireframeToggle  = /** @type {HTMLInputElement}  */ (document.getElementById('wireframe-toggle'));
 const gridToggle       = /** @type {HTMLInputElement}  */ (document.getElementById('grid-toggle'));
 const gridSpacingRow   = document.getElementById('grid-spacing-row');
@@ -30,6 +32,7 @@ const roadsExpresswayToggle= /** @type {HTMLInputElement} */ (document.getElemen
 const roadsProvincialToggle= /** @type {HTMLInputElement} */ (document.getElementById('roads-provincial'));
 const boundariesToggle     = /** @type {HTMLInputElement} */ (document.getElementById('boundaries-toggle'));
 const hillshadeToggle      = /** @type {HTMLInputElement} */ (document.getElementById('hillshade-toggle'));
+const buildingsToggle      = /** @type {HTMLInputElement} */ (document.getElementById('buildings-toggle'));
 const lodBadge         = document.getElementById('lod-badge');
 const coordHud        = document.getElementById('coord-hud');
 const legendMin       = document.getElementById('legend-min');
@@ -51,6 +54,8 @@ const langToggle      = document.getElementById('language-toggle');
 // masked (stencil != 1) wherever a tile drew, so gaps while tiles stream show the 100 m
 // surface instead of black — no overlap, no flicker.
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true, stencil: true });
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 // Performance HUD (MS / MB) pinned to the viewport's top-left.
 const stats = createStats();
@@ -90,11 +95,28 @@ renderer.domElement.addEventListener('wheel', () => {
   movingTimer = setTimeout(() => { cameraMoving = false; }, 500);
 });
 
-// ── Lighting (from NW at 45°; X=East, Y=Up, Z=South in GLB) ────────────────────
+// ── Lighting (sun direction driven by the time-of-day slider; X=East, Y=Up, Z=South) ──
 const dirLight = new THREE.DirectionalLight(0xfff5e8, 1.8);
 dirLight.position.set(-1, 1.2, -1);
+const ambient = new THREE.AmbientLight(0x3a4060, 0.7);
 scene.add(dirLight);
-scene.add(new THREE.AmbientLight(0x3a4060, 0.7));
+scene.add(ambient);
+
+// Shadows: the directional light + its orthographic shadow camera FOLLOW the orbit
+// target each frame, sized to the building view (a few km) — full-island shadow maps
+// would be useless resolution. SHADOW_DIST is how far back the light sits.
+const SHADOW_R    = 3000;   // half-extent of the shadow frustum (world m)
+const SHADOW_DIST = 12000;  // light distance from target along the sun direction
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.near = 100;
+dirLight.shadow.camera.far  = SHADOW_DIST * 2;
+dirLight.shadow.camera.left   = -SHADOW_R;
+dirLight.shadow.camera.right  =  SHADOW_R;
+dirLight.shadow.camera.top    =  SHADOW_R;
+dirLight.shadow.camera.bottom = -SHADOW_R;
+dirLight.shadow.bias = -0.0005;
+scene.add(dirLight.target);
 
 // ── Elevation color maps ─────────────────────────────────────────────────────────
 /** @type {Record<string, (t: number) => [number,number,number]>} */
@@ -258,6 +280,25 @@ let movingTimer     = null;
 const _detFrustum = new THREE.Frustum();
 const _detProj    = new THREE.Matrix4();
 const _detSphere  = new THREE.Sphere();
+
+// ── Building streaming (white massing + box LOD) ───────────────────────────────────
+// Two representations per 5 km tile (same keys/cx/cz): massing (source geometry) and
+// box (per-building AABB). Altitude gates visibility; per-tile distance picks the LOD.
+const BUILDING_FAR    = 12000; // alt (m above terrain) above this → unload all buildings
+const BUILDING_DETAIL = 4000;  // tile within this of camera → massing, else box
+const buildingGroup = new THREE.Group();
+/** @type {{tileSize:number, tiles:{key:string,cx:number,cz:number}[]}|null} */
+let buildingIndex = null;
+/** @type {Map<string, THREE.Mesh>} */ const buildingMassing = new Map();
+/** @type {Map<string, THREE.Mesh>} */ const buildingBoxes   = new Map();
+const massingLoading = new Set();
+const boxLoading     = new Set();
+let buildingFrameCount = 0;
+// Plain white material — the existing directional light gives clean faceted shading
+// (Mirror's Edge look); no TWD97 grid overlay (unlike terrainMat).
+const buildingMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.92, metalness: 0.0, side: THREE.DoubleSide,
+});
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
 function setPanelOpen(open) {
@@ -467,6 +508,7 @@ zScaleSlider.addEventListener('input', () => {
   if (terrainGroup) terrainGroup.scale.y = userZScale;
   detailGroup.scale.y = userZScale;
   baseTileGroup.scale.y = userZScale;
+  buildingGroup.scale.y = userZScale;
   updateRoadY();
   updateBoundaryY();
 });
@@ -676,6 +718,7 @@ function loadTile(tile, level) {
       if (!mesh || !tileMat) return;
       colorTileGeometry(mesh.geometry, currentColorMap);
       const m = new THREE.Mesh(mesh.geometry, tileMat);
+      m.receiveShadow = true; // catch building shadows cast onto the terrain
       m.userData.cx = tile.cx;
       m.userData.cz = tile.cz;
       // Dispose the 100 m tile BEFORE adding the 20 m tile to avoid one-frame Z-fighting.
@@ -833,6 +876,93 @@ function updateTiles() {
   setDetailBadge();
 }
 
+// ── Building streaming ─────────────────────────────────────────────────────────────
+/** @param {Map<string,THREE.Mesh>} map @param {string} key */
+function disposeBuilding(map, key) {
+  const m = map.get(key);
+  if (!m) return;
+  buildingGroup.remove(m);
+  m.geometry.dispose();
+  map.delete(key);
+}
+
+/**
+ * Load one building tile at the given LOD. 'massing' = source geometry, 'box' = AABB.
+ * @param {{key:string,cx:number,cz:number}} tile @param {'massing'|'box'} lod
+ */
+function loadBuilding(tile, lod) {
+  const isMassing = lod === 'massing';
+  const map     = isMassing ? buildingMassing : buildingBoxes;
+  const loading = isMassing ? massingLoading  : boxLoading;
+  const dir     = isMassing ? 'building_tiles' : 'building_boxes';
+  loading.add(tile.key);
+  loader.load(
+    `${import.meta.env.BASE_URL}${dir}/${tile.key}.glb`,
+    (gltf) => {
+      loading.delete(tile.key);
+      let mesh = null;
+      gltf.scene.traverse((n) => { if (n.isMesh && !mesh) mesh = n; });
+      if (!mesh) return;
+      const m = new THREE.Mesh(mesh.geometry, buildingMat);
+      m.castShadow = true;
+      m.receiveShadow = true;
+      m.userData.cx = tile.cx;
+      m.userData.cz = tile.cz;
+      buildingGroup.add(m);
+      map.set(tile.key, m);
+    },
+    undefined,
+    () => { loading.delete(tile.key); },
+  );
+}
+
+/**
+ * Stream building tiles. Altitude gates visibility (far → all unloaded); per-tile
+ * camera distance picks the LOD: near → massing, else → box (the "simple squares").
+ */
+function updateBuildings() {
+  if (!buildingIndex || !terrainBBox) return;
+
+  const alt = camera.position.y - terrainBBox.min.y;
+  // Hidden via the Buildings toggle, or too high: unload everything and stop streaming.
+  if (!buildingsToggle.checked || alt > BUILDING_FAR) {
+    for (const k of [...buildingMassing.keys()]) disposeBuilding(buildingMassing, k);
+    for (const k of [...buildingBoxes.keys()])   disposeBuilding(buildingBoxes, k);
+    return;
+  }
+
+  const cxw = camera.position.x;
+  const czw = camera.position.z;
+  _detProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _detFrustum.setFromProjectionMatrix(_detProj);
+
+  const sy = buildingGroup.scale.y;
+  const midY = (terrainBBox.min.y + terrainBBox.max.y) * 0.5 * sy;
+  const tileR = (buildingIndex.tileSize ?? 5000) * 0.75;
+
+  const visibleKeys = new Set();
+  for (const t of buildingIndex.tiles) {
+    _detSphere.center.set(t.cx, midY, t.cz);
+    _detSphere.radius = tileR;
+    if (!_detFrustum.intersectsSphere(_detSphere)) continue;
+    visibleKeys.add(t.key);
+
+    const d = Math.hypot(t.cx - cxw, t.cz - czw);
+    const wantMassing = d < BUILDING_DETAIL;
+    if (wantMassing) {
+      if (buildingBoxes.has(t.key)) disposeBuilding(buildingBoxes, t.key);
+      if (!buildingMassing.has(t.key) && !massingLoading.has(t.key)) loadBuilding(t, 'massing');
+    } else {
+      if (buildingMassing.has(t.key)) disposeBuilding(buildingMassing, t.key);
+      if (!buildingBoxes.has(t.key) && !boxLoading.has(t.key)) loadBuilding(t, 'box');
+    }
+  }
+
+  // Evict tiles that left the frustum.
+  for (const k of [...buildingMassing.keys()]) if (!visibleKeys.has(k)) disposeBuilding(buildingMassing, k);
+  for (const k of [...buildingBoxes.keys()])   if (!visibleKeys.has(k)) disposeBuilding(buildingBoxes, k);
+}
+
 // ── Terrain chunking ─────────────────────────────────────────────────────────────
 // Split a single BufferGeometry into CHUNK_R × CHUNK_C sub-meshes so Three.js
 // frustum culling can discard off-screen chunks individually.
@@ -906,12 +1036,29 @@ function buildTerrainGroup(geometry) {
   for (const m of meshes) terrainBBox.union(m.geometry.boundingBox);
 }
 
-// ── Sun position ─────────────────────────────────────────────────────────────────
+// ── Sun position (time-of-day) ─────────────────────────────────────────────────────
 /**
- * Simplified astronomical sun position for Taiwan (≈25°N, equinox declination).
- * @param {number} hour - solar time (0–24)
- * @returns {{ alt: number, az: number, above: boolean }}
+ * Set the world sun direction from a clock hour. Daylight arc 6→18: sun rises in the
+ * east, peaks high in the southern sky at noon, sets in the west. Outside that it sits
+ * just below the horizon (dim). Also fades light intensity near dawn/dusk.
+ * GLB axes: X=East, Y=Up, Z=South.
+ * @param {number} hour 0–24
  */
+function setSunFromHour(hour) {
+  const dayFrac = (hour - 6) / 12;          // 0 at 06:00 → 1 at 18:00
+  const a = dayFrac * Math.PI;              // 0 → π across the day
+  const el = Math.sin(a);                   // elevation factor: 0 horizon → 1 noon
+  const east = Math.cos(a);                 // +1 east (AM) → −1 west (PM)
+  const up = Math.max(0.04, el);            // keep just above horizon for grazing light
+  const south = 0.35 * el + 0.15;           // sun biased into the southern sky (Taiwan)
+  sunDirWorld.set(east, up, south).normalize();
+
+  // Dim toward dawn/dusk; near-dark outside daylight.
+  const day = Math.max(0, el);
+  dirLight.intensity = 0.25 + 2.0 * day;
+  ambient.intensity  = 0.45 + 0.35 * day;
+}
+
 // ── Terrain height grid (for road elevation lookup) ──────────────────────────────
 /** @type {Map<string, number>|null} built once from first terrain load */
 let terrainHeightGrid = null;
@@ -1191,6 +1338,19 @@ hillshadeToggle.addEventListener('change', () => {
   sunUniforms.uHillshade.value = hillshadeToggle.checked ? 1.0 : 0.0;
 });
 
+buildingsToggle.addEventListener('change', () => {
+  buildingGroup.visible = buildingsToggle.checked;
+});
+
+timeSlider.addEventListener('input', () => {
+  const hour = parseFloat(timeSlider.value);
+  const h = Math.floor(hour);
+  const m = Math.round((hour - h) * 60);
+  timeValue.textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  setSunFromHour(hour);
+});
+setSunFromHour(parseFloat(timeSlider.value)); // initialise sun from the default slider value
+
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
 const dracoLoader = new DRACOLoader();
@@ -1319,19 +1479,13 @@ loader.setDRACOLoader(dracoLoader);
         .then((d) => { if (d && d.tiles) { tileIndex = d; buildTileSpatialIndex(); } })
         .catch(() => { console.info('[tiles] tiles/index.json not found — run: just tile'); });
 
-      // ── PoC: load white building massing (region 3357) for alignment check ──
-      // TEMPORARY — remove once the building tile pipeline + streaming lands.
-      {
-        const buildingMat = new THREE.MeshStandardMaterial({
-          color: 0xffffff, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
-        });
-        loader.load(import.meta.env.BASE_URL + 'buildings_poc.glb', (gltf) => {
-          gltf.scene.traverse((n) => { if (n.isMesh) n.material = buildingMat; });
-          gltf.scene.scale.y = userZScale;
-          scene.add(gltf.scene);
-          console.info('[poc] buildings_poc.glb loaded');
-        }, undefined, () => console.info('[poc] buildings_poc.glb not found'));
-      }
+      // Building tiles: white massing + box LOD, streamed by updateBuildings().
+      buildingGroup.scale.y = userZScale;
+      scene.add(buildingGroup);
+      fetch(import.meta.env.BASE_URL + 'building_tiles/index.json')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d && d.tiles) buildingIndex = d; })
+        .catch(() => { console.info('[buildings] building_tiles/index.json not found — run: just buildings'); });
 
       // Skip intro animation — jump straight to the initial Taipei viewpoint.
       cameraReset();
@@ -1495,6 +1649,11 @@ let lastFrameTime = 0;
     .copy(sunDirWorld)
     .transformDirection(camera.matrixWorldInverse);
 
+  // Keep the directional light + its shadow frustum centred on the orbit target so
+  // shadows render at usable resolution around wherever the user is looking.
+  dirLight.target.position.copy(controls.target);
+  dirLight.position.copy(controls.target).addScaledVector(sunDirWorld, SHADOW_DIST);
+
   controls.update();
 
   // LOD check once per ~60 frames; skip during intro orbit to avoid racing the first load
@@ -1505,6 +1664,7 @@ let lastFrameTime = 0;
 
   // Tiled-LOD streaming: more frequent than LOD (camera focus moves continuously)
   if (++detailFrameCount % 15 === 0 && introComplete) updateTiles();
+  if (++buildingFrameCount % 20 === 0 && introComplete) updateBuildings();
 
   renderer.render(scene, camera);
   renderGizmo();
