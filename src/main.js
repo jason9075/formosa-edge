@@ -63,7 +63,16 @@ document.body.appendChild(stats.dom);
 renderer.setPixelRatio(window.devicePixelRatio);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1a1a1e);
+// Two looks, switched by colour map (see applyTheme): the default dark backdrop, and the
+// Mirror's Edge bright cool-white sky where distant geometry fades into fog.
+const DARK_BG   = new THREE.Color(0x1a1a1e);
+const SKY_COLOR = new THREE.Color(0x8ec5ee); // current sky (also fog/horizon); set by setSunFromHour
+const SKY_DAY   = new THREE.Color(0x8ec5ee); // midday blue
+const SKY_DUSK  = new THREE.Color(0x3a3550); // dim, slightly warm-purple at dawn/dusk
+// Linear fog for the ME hazy horizon. near/far are retuned per-frame by altitude: tight
+// at city scale (atmospheric haze), pushed far at island overview (stays clear).
+const meFog = new THREE.Fog(SKY_COLOR, 8000, 50000);
+scene.background = DARK_BG;
 
 // Far plane spans the full main island (~400 km N–S) for the merged overview.
 const camera = new THREE.PerspectiveCamera(60, 1, 1, 1000000);
@@ -96,11 +105,14 @@ renderer.domElement.addEventListener('wheel', () => {
 });
 
 // ── Lighting (sun direction driven by the time-of-day slider; X=East, Y=Up, Z=South) ──
+// Warm-white key sun + a hemisphere fill (cool-white sky, muted blue ground) so lit
+// faces read near-white while shadowed/downward faces pick up the blue ambient —
+// the Mirror's Edge "white clay + blue shadow" look.
 const dirLight = new THREE.DirectionalLight(0xfff5e8, 1.8);
 dirLight.position.set(-1, 1.2, -1);
-const ambient = new THREE.AmbientLight(0x3a4060, 0.7);
+const hemi = new THREE.HemisphereLight(0xeaf2ff, 0x6f8fb5, 0.9);
 scene.add(dirLight);
-scene.add(ambient);
+scene.add(hemi);
 
 // Shadows: the directional light + its orthographic shadow camera FOLLOW the orbit
 // target each frame, sized to the building view (a few km) — full-island shadow maps
@@ -121,6 +133,27 @@ scene.add(dirLight.target);
 // ── Elevation color maps ─────────────────────────────────────────────────────────
 /** @type {Record<string, (t: number) => [number,number,number]>} */
 const COLOR_MAPS = {
+  // Mirror's Edge look: a clean near-white surface (faint cool tint low → pure white
+  // high). Form comes from hillshade + cast shadows, not the palette — keeps terrain
+  // and the white building massing cohesively bright.
+  'edge': (t) => {
+    const stops = [
+      [0.00, 0.70, 0.80, 0.92],
+      [0.45, 0.86, 0.91, 0.97],
+      [1.00, 1.00, 1.00, 1.00],
+    ];
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const f = (t - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+        return [
+          stops[i-1][1] + (stops[i][1] - stops[i-1][1]) * f,
+          stops[i-1][2] + (stops[i][2] - stops[i-1][2]) * f,
+          stops[i-1][3] + (stops[i][3] - stops[i-1][3]) * f,
+        ];
+      }
+    }
+    return [1, 1, 1];
+  },
   terrain: (t) => {
     // Guidelines: 0–200m green, 200–600m brown, 600–1500m mountain, 1500m+ gray
     const stops = [
@@ -220,7 +253,7 @@ let terrainBBox = null;
 /** @type {Record<string,number>} */
 let glbMeta = {};
 let userZScale = 1.0;
-let currentColorMap = 'terrain';
+let currentColorMap = 'edge';
 let panelOpen = window.innerWidth >= 1280;
 let modalLang = 'en';
 let hintTimer = null;
@@ -531,6 +564,7 @@ gridSpacingSelect.addEventListener('change', () => {
 
 colorMapSelect.addEventListener('change', () => {
   currentColorMap = colorMapSelect.value;
+  applyTheme(currentColorMap);
   if (terrainMeshes.length > 0) applyVertexColors(terrainMeshes, currentColorMap);
   // Recolour resident tiles against the (possibly updated) base range.
   for (const m of detailTiles.values()) colorTileGeometry(m.geometry, currentColorMap);
@@ -910,6 +944,10 @@ function loadBuilding(tile, lod) {
       m.userData.cz = tile.cz;
       buildingGroup.add(m);
       map.set(tile.key, m);
+      // Drop the other LOD only now that this one is on screen — never leave a gap
+      // where the tile has neither (the "disappears while panning" bug).
+      if (isMassing) disposeBuilding(buildingBoxes, tile.key);
+      else           disposeBuilding(buildingMassing, tile.key);
     },
     undefined,
     () => { loading.delete(tile.key); },
@@ -947,13 +985,15 @@ function updateBuildings() {
     if (!_detFrustum.intersectsSphere(_detSphere)) continue;
     visibleKeys.add(t.key);
 
+    // LOD with hysteresis: keep an existing massing tile until clearly past the
+    // threshold so panning across the boundary doesn't thrash. The opposite LOD is
+    // disposed in loadBuilding's callback (after the new one is on screen), not here.
     const d = Math.hypot(t.cx - cxw, t.cz - czw);
-    const wantMassing = d < BUILDING_DETAIL;
+    const hasMassing = buildingMassing.has(t.key);
+    const wantMassing = d < BUILDING_DETAIL || (hasMassing && d < BUILDING_DETAIL + LOD_HYST);
     if (wantMassing) {
-      if (buildingBoxes.has(t.key)) disposeBuilding(buildingBoxes, t.key);
-      if (!buildingMassing.has(t.key) && !massingLoading.has(t.key)) loadBuilding(t, 'massing');
+      if (!hasMassing && !massingLoading.has(t.key)) loadBuilding(t, 'massing');
     } else {
-      if (buildingMassing.has(t.key)) disposeBuilding(buildingMassing, t.key);
       if (!buildingBoxes.has(t.key) && !boxLoading.has(t.key)) loadBuilding(t, 'box');
     }
   }
@@ -1053,10 +1093,35 @@ function setSunFromHour(hour) {
   const south = 0.35 * el + 0.15;           // sun biased into the southern sky (Taiwan)
   sunDirWorld.set(east, up, south).normalize();
 
-  // Dim toward dawn/dusk; near-dark outside daylight.
+  // Dim toward dawn/dusk; keep a soft blue fill at all times.
   const day = Math.max(0, el);
   dirLight.intensity = 0.25 + 2.0 * day;
-  ambient.intensity  = 0.45 + 0.35 * day;
+  hemi.intensity     = 0.55 + 0.45 * day;
+
+  // Sky + fog brightness follows the sun: midday blue → dim warm-purple at dawn/dusk.
+  // Mutating SKY_COLOR in place updates the live background (set by reference in the
+  // Edge theme); fog.color is a separate copy, so update both. No effect on other themes.
+  SKY_COLOR.copy(SKY_DUSK).lerp(SKY_DAY, day);
+  meFog.color.copy(SKY_COLOR);
+}
+
+/**
+ * Apply the scene look for a colour map. Only 'mirrors-edge' gets the bright white sky
+ * + fog + blue hemisphere fill; every other map keeps the original dark backdrop, no
+ * fog, and a neutral dark ambient.
+ * @param {string} map
+ */
+function applyTheme(map) {
+  const me = map === 'edge';
+  scene.background = me ? SKY_COLOR : DARK_BG;
+  scene.fog = me ? meFog : null;
+  if (me) {
+    hemi.color.set(0xeaf2ff);
+    hemi.groundColor.set(0x6f8fb5);
+  } else {
+    hemi.color.set(0x3a4060);      // matches the original uniform dark-blue ambient
+    hemi.groundColor.set(0x3a4060);
+  }
 }
 
 // ── Terrain height grid (for road elevation lookup) ──────────────────────────────
@@ -1350,6 +1415,7 @@ timeSlider.addEventListener('input', () => {
   setSunFromHour(hour);
 });
 setSunFromHour(parseFloat(timeSlider.value)); // initialise sun from the default slider value
+applyTheme(currentColorMap);                  // apply the default colour map's scene look
 
 
 // ── Load terrain ─────────────────────────────────────────────────────────────────
@@ -1547,8 +1613,9 @@ function tickFlyKeys(dt) {
   if (keysDown.has('s')) _flyDelta.addScaledVector(_fwd,  -speed);
   if (keysDown.has('a')) _flyDelta.addScaledVector(_right, -speed);
   if (keysDown.has('d')) _flyDelta.addScaledVector(_right,  speed);
-  if (keysDown.has('q')) _flyDelta.y -= speed;
-  if (keysDown.has('e')) _flyDelta.y += speed;
+  const vSpeed = speed * 0.35; // Q/E vertical move is gentler than WASD pan
+  if (keysDown.has('q')) _flyDelta.y -= vSpeed;
+  if (keysDown.has('e')) _flyDelta.y += vSpeed;
 
   camera.position.add(_flyDelta);
   controls.target.add(_flyDelta);
@@ -1653,6 +1720,15 @@ let lastFrameTime = 0;
   // shadows render at usable resolution around wherever the user is looking.
   dirLight.target.position.copy(controls.target);
   dirLight.position.copy(controls.target).addScaledVector(sunDirWorld, SHADOW_DIST);
+
+  // Retune fog by altitude (changing near/far is just uniforms — no material recompile).
+  // City scale → tight haze into the white horizon; island overview → pushed away so the
+  // whole map stays clear. Only active in the Mirror's Edge theme (scene.fog set).
+  if (scene.fog && terrainBBox) {
+    const alt = camera.position.y - terrainBBox.min.y;
+    if (alt < 20000) { scene.fog.near = 18000;  scene.fog.far = 110000; }
+    else             { scene.fog.near = 300000; scene.fog.far = 1200000; }
+  }
 
   controls.update();
 
