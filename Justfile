@@ -22,9 +22,6 @@ fetch:
 convert-100m:
     python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_100m.glb --step 5
 
-# 40m decimated — heavier mid-zoom LOD (measure size before shipping)
-convert-fast:
-    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_40m.glb --step 2
 
 # Slice merged island into streamable tiles (two-level LOD) + draco-compress.
 # Both levels share taiwan_100m.glb's centre and the same 5 km grid keys, with +1-cell
