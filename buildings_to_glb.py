@@ -299,13 +299,16 @@ def building_box(world_pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         [x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1],  # base 0..3
         [x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1],  # roof 4..7
     ], dtype=np.float32)
+    # Winding chosen so every face normal points OUTWARD (verified against
+    # cross(v1-v0, v2-v0)); the frontend renders FrontSide, so inward faces would
+    # be culled / mis-lit. Verts: 0-3 base (y0), 4-7 roof (y1); x0<x1, z0<z1.
     f = np.array([
-        [0, 2, 1], [0, 3, 2],            # bottom
-        [4, 5, 6], [4, 6, 7],            # top
-        [0, 1, 5], [0, 5, 4],            # -z wall
-        [1, 2, 6], [1, 6, 5],            # +x wall
-        [2, 3, 7], [2, 7, 6],            # +z wall
-        [3, 0, 4], [3, 4, 7],            # -x wall
+        [0, 1, 2], [0, 2, 3],            # bottom (−Y)
+        [4, 7, 6], [4, 6, 5],            # top    (+Y)
+        [0, 4, 5], [0, 5, 1],            # −Z wall (north)
+        [3, 2, 6], [3, 6, 7],            # +Z wall (south)
+        [1, 6, 2], [1, 5, 6],            # +X wall (east)
+        [0, 3, 7], [0, 7, 4],            # −X wall (west)
     ], dtype=np.uint32)
     return v, f
 
