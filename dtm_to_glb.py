@@ -45,8 +45,13 @@ def parse_hdr(path: Path) -> dict:
 
 
 def load_tiles(data_dir: Path) -> tuple[np.ndarray, float]:
-    """Load all GRD tiles; return (N×3 float64 array of X,Y,Z), grid spacing."""
-    hdr_files = sorted(data_dir.glob('*.hdr'))
+    """Load all GRD tiles; return (N×3 float64 array of X,Y,Z), grid spacing.
+
+    Searches recursively (rglob), so a parent dir holding many per-county
+    subdirs (e.g. raw/ with raw/taipei, raw/taichung, …) merges every county's
+    tiles into one point cloud — and thus one shared-centre mesh.
+    """
+    hdr_files = sorted(data_dir.rglob('*.hdr'))
     if not hdr_files:
         raise FileNotFoundError(f'No .hdr files in {data_dir}')
 
@@ -206,6 +211,18 @@ def write_glb(
     ], axis=-1).reshape(-1, 3)  # (N, 3)
 
     norms = normals.reshape(-1, 3).astype(np.float32)
+
+    # Compact: drop vertices no face references (every no-data/sea grid cell adds
+    # an unused z=0 vertex — ~half the grid for an island). Remap face indices.
+    used = np.unique(faces)
+    if len(used) < len(positions):
+        remap = np.full(len(positions), -1, dtype=np.int64)
+        remap[used] = np.arange(len(used), dtype=np.int64)
+        positions = positions[used]
+        norms = norms[used]
+        faces = remap[faces].astype(np.uint32)
+        print(f'Compacted vertices: {len(used):,} kept '
+              f'({100 * len(used) / (rows * cols):.1f}% of grid)')
 
     v_count = len(positions)
     i_count = faces.size

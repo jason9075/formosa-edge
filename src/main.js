@@ -52,7 +52,8 @@ renderer.setPixelRatio(window.devicePixelRatio);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a1e);
 
-const camera = new THREE.PerspectiveCamera(60, 1, 1, 100000);
+// Far plane spans the full main island (~400 km N–S) for the merged overview.
+const camera = new THREE.PerspectiveCamera(60, 1, 1, 1000000);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping  = true;
@@ -440,12 +441,13 @@ colorMapSelect.addEventListener('change', () => {
 //   3000–8000 m            → 40 m mesh  (regional zoom)
 //   < 3000 m               → 20 m mesh  (detail zoom)
 const BASE = import.meta.env.BASE_URL;
+// Merged main-island terrain. A full 20 m island mesh is not web-viable
+// (~90 M verts), so the overview ships at 100 m; finer LODs can be added here
+// once produced (e.g. taiwan_40m.glb).
 const LOD_LEVELS = [
-  { url: BASE + 'taipei_20m.glb',  label: '20 m',  maxAlt: 3500     },
-  { url: BASE + 'taipei_40m.glb',  label: '40 m',  maxAlt: 7000     },
-  { url: BASE + 'taipei_100m.glb', label: '100 m', maxAlt: Infinity },
+  { url: BASE + 'taiwan_100m.glb', label: '100 m', maxAlt: Infinity },
 ];
-const GLB_URL = BASE + 'taipei_100m.glb';
+const GLB_URL = BASE + 'taiwan_100m.glb';
 
 function setLodBadge(text, loading = false) {
   lodBadge.textContent = text;

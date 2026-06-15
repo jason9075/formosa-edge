@@ -1,30 +1,40 @@
-data_dir := "raw/taipei"
+data_dir := "raw"
 out_dir  := "output"
+csv      := "scripts/dtm_sources.csv"
 
 set shell := ["sh", "-c"]
 
 default:
     @just --list
 
-# ── DTM conversion ──────────────────────────────────────────────────────────────
+# ── DTM acquisition ──────────────────────────────────────────────────────────────
 
-# Full resolution 20m — ~65 MB, production quality
-convert:
-    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_20m.glb
+# Download + extract every main-island county (19) from the TGOS catalogue → raw/<slug>/
+# Outlying islands (Penghu/Kinmen/Lienchiang) are excluded: too far offshore to merge.
+fetch:
+    python3 scripts/fetch_dtm.py {{csv}} --out {{data_dir}} --main-island --skip-existing
 
-# 40m decimated — ~18 MB, mid quality
-convert-fast:
-    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_40m.glb --step 2
+# ── DTM conversion (merged main island) ──────────────────────────────────────────
+# dtm_to_glb.py rglobs all raw/<county>/*.hdr → one shared-centre mesh.
+# A full 20 m island mesh is not web-viable (~90 M verts); 100 m is the overview.
 
-# 100m decimated — ~3 MB, default for web preview
+# 100m decimated — merged island overview (~7 MB draco)
 convert-100m:
-    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_100m.glb --step 5
+    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_100m.glb --step 5
+
+# 40m decimated — heavier mid-zoom LOD (measure size before shipping)
+convert-fast:
+    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_40m.glb --step 2
+
+# Single-county mesh at full 20 m (e.g. just convert-county taipei) → output/<slug>_20m.glb
+convert-county slug='taipei':
+    python3 dtm_to_glb.py {{data_dir}}/{{slug}} {{out_dir}}/{{slug}}_20m.glb
 
 # Draco-compress all GLBs in output/ in-place (level 7 — good balance of size vs decode speed)
 # Run after any convert-* target. Requires node_modules (just install).
 compress-glb:
     @[ -d node_modules ] || npm install --ignore-scripts
-    @for glb in output/taipei_100m.glb output/taipei_40m.glb output/taipei_20m.glb; do \
+    @for glb in output/*.glb; do \
         [ -f "$$glb" ] || continue; \
         echo "Compressing $$glb …"; \
         node node_modules/.bin/gltf-pipeline -i "$$glb" -o "$$glb" --draco.compressionLevel 7; \
@@ -38,29 +48,29 @@ stage-draco:
     cp node_modules/three/examples/jsm/libs/draco/draco_decoder.js public/draco/
     @echo "Draco decoder staged to public/draco/"
 
-# Extract road centrelines from shapefile → output/roads.json
+# Extract road centrelines from shapefile → output/roads.json (clipped to terrain extent)
 convert-roads:
-    python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taipei_100m.glb output/roads.json
+    python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taiwan_100m.glb output/roads.json
 
 # Extract township boundary rings from shapefile → output/boundaries.json
 convert-boundaries:
-    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taipei_100m.glb output/boundaries.json
+    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taiwan_100m.glb output/boundaries.json
 
 # 100m + 2× elevation exaggeration
 convert-exag:
-    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taipei_exag.glb --step 5 --z-scale 2.0
+    python3 dtm_to_glb.py {{data_dir}} {{out_dir}}/taiwan_exag.glb --step 5 --z-scale 2.0
 
-# Inspect a single tile header
-inspect tile='97233072':
-    @iconv -f cp950 -t utf8 {{data_dir}}/{{tile}}dem.hdr
+# Inspect a single tile header (e.g. just inspect taipei 97233072)
+inspect county='taipei' tile='97233072':
+    @iconv -f cp950 -t utf8 {{data_dir}}/{{county}}/{{tile}}dem.hdr
     @echo "---"
-    @head -3 {{data_dir}}/{{tile}}dem.grd
+    @head -3 {{data_dir}}/{{county}}/{{tile}}dem.grd
     @echo "..."
-    @wc -l {{data_dir}}/{{tile}}dem.grd
+    @wc -l {{data_dir}}/{{county}}/{{tile}}dem.grd
 
 # Show bounding box / metadata via GDAL (requires gdal in shell)
-info tile='97233072':
-    gdalinfo {{data_dir}}/{{tile}}dem.grd
+info county='taipei' tile='97233072':
+    gdalinfo {{data_dir}}/{{county}}/{{tile}}dem.grd
 
 # Clean generated GLB outputs
 clean:
