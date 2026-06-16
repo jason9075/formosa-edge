@@ -76,7 +76,7 @@ const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
 /** @type {THREE.Texture|null} */
 let hdrBackground = null;
-new RGBELoader().load('/env/sky_1k.hdr', (tex) => {
+new RGBELoader().load(import.meta.env.BASE_URL + 'env/sky_1k.hdr', (tex) => {
   tex.mapping = THREE.EquirectangularReflectionMapping;
   hdrBackground = tex;
   pmrem.dispose();
