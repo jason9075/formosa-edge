@@ -47,6 +47,16 @@ rivers:
     @ls {{out_dir}}/river_tiles/*.glb | xargs -P 8 -I{} node node_modules/.bin/gltf-pipeline -i {} -o {} --draco.compressionLevel 7 >/dev/null 2>&1
     @echo "Rivers: $(ls {{out_dir}}/river_tiles/*.glb | wc -l) files, $(du -sh {{out_dir}}/river_tiles | cut -f1)"
 
+# Clip terrain + buildings to a WGS84 box → one standalone GLB (terrain + buildings nodes).
+# Needs built output/tiles + output/building_tiles. Coords: SW/NE as "LAT LON".
+# Example: just merge-region 25.05787 121.56175 25.06124 121.56572 output/region_xinyi.glb
+merge-region sw_lat sw_lon ne_lat ne_lon out="output/region.glb":
+    @[ -d node_modules ] || npm install --ignore-scripts
+    python3 merge_region_glb.py \
+        --tiles {{out_dir}}/tiles --buildings {{out_dir}}/building_tiles \
+        --sw {{sw_lat}} {{sw_lon}} --ne {{ne_lat}} {{ne_lon}} \
+        --out {{out}} --draco --recenter
+
 # Draco-compress every output/*.glb in place (run after convert-100m; tile/buildings/rivers self-compress)
 compress-glb:
     @[ -d node_modules ] || npm install --ignore-scripts
