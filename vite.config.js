@@ -33,7 +33,7 @@ function serveOutputPlugin() {
 }
 
 export default defineConfig({
-  base: process.env.NODE_ENV === 'production' ? '/DTM-Visualizer/' : '/',
+  base: process.env.NODE_ENV === 'production' ? '/formosa-edge/' : '/',
   plugins: [serveOutputPlugin()],
   server: { port: 8080 },
   build: { outDir: 'dist' },
