@@ -202,32 +202,35 @@ The road shapefile is already in TWD97 TM2 (EPSG:3826) — no reprojection is ne
 | Code | Class | Colour |
 |------|-------|--------|
 | `H*` | National freeway | Orange-red |
-| `1E` | Expressway | Light blue |
+| `1E` | Expressway | Gold |
 | `1U`, `1W` | Provincial road | Teal |
 
 **Pipeline:**
 
 1. Reads polyline geometries with `pyshp`.
 2. Filters segments to the terrain bounding box (+ 1 km margin).
-3. Applies the same XZ mapping as the GLB:
+3. Simplifies each polyline (Douglas-Peucker, 1 m via `shapely`) and applies the GLB XZ mapping:
 
    ```python
    x = Easting  - x_center
    z = -(Northing - y_center)
    ```
 
-4. Emits flat edge-pair arrays per class (`[x0,z0,x1,z1, ...]`), yielding ~40 k edges total.
-5. Writes `output/roads.json` (~1.2 MB).
+4. **Bakes Y per vertex** by sampling the terrain (`--dtm`, a 40 m `TerrainSampler` over the
+   whole island), so `y = raw elevation (m)`. This is the key optimisation: the viewer never
+   re-clamps roads onto streaming tiles at runtime.
+5. Emits per-class arrays of **3-D polyline strips** (`[[x0,y0,z0,x1,y1,z1,…], …]` — no edge-pair
+   vertex duplication), coords rounded to 1 m integers. Writes `output/roads.json` (~3.9 MB).
 
-In Three.js, each class becomes a single `THREE.LineSegments` (one draw call per class).
-Road vertex Y is sampled from a **terrain height grid** built from the 100 m GLB: for each
-vertex the maximum elevation among the four surrounding 100 m grid cells is used, so
-road lines stay above the terrain surface across the full range of Z-Scale settings.
+In Three.js each class expands to one `LineSegments2` fat line (one draw call per class). Because
+Y is baked, **there is no runtime height sampling or rebake** — roads simply load at the correct
+elevation. Z-Scale still works because the baked Y is the *unscaled* elevation and the group
+scales it live:
 
 ```js
-// world_Y = ROAD_LIFT + userZScale × max_surrounding_elevation
-roadGroup.position.y = ROAD_LIFT;   // constant world offset
-roadGroup.scale.y    = userZScale;  // co-scales with terrain
+// world_Y = ROAD_LIFT + userZScale × baked_elevation
+roadGroup.position.y = ROAD_LIFT;   // constant world offset (lift above terrain)
+roadGroup.scale.y    = userZScale;  // co-scales the baked elevation with terrain
 ```
 
 ---

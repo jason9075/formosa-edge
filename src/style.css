@@ -53,7 +53,7 @@ body {
   font-size: 0.85rem;
   color: var(--accent);
   letter-spacing: 0.03em;
-  font-weight: 500;
+  font-weight: 700;
 }
 
 .top-actions {
@@ -63,8 +63,8 @@ body {
   height: 100%;
 }
 
-/* 💡 knowledge button — header icon button (moved out of the floating FAB) */
-#open-math {
+/* Header icon buttons — 🐞 debug toggle + 💡 knowledge */
+#open-math, #debug-toggle {
   background: rgba(0, 0, 0, 0.05);
   border: 1px solid var(--border);
   color: var(--text);
@@ -79,7 +79,9 @@ body {
   transition: background 0.15s, transform 0.15s;
   flex-shrink: 0;
 }
-#open-math:hover { background: var(--accent-soft); transform: scale(1.08); }
+#open-math:hover, #debug-toggle:hover { background: var(--accent-soft); transform: scale(1.08); }
+/* Debug button lit while the overlay is shown */
+#debug-toggle.active { background: var(--accent); border-color: var(--accent); }
 
 /* ── Control panel ─────────────────────────────────────────────── */
 /* Light frosted-glass surfaces — header, side panel, footer share one light theme.
@@ -550,4 +552,35 @@ input[type="range"]::-moz-range-thumb {
   }
 
   #operation-hint { display: none; }
+}
+
+/* ── Region-name labels (CSS2D pins over admin boundaries) ────────────────────────
+   The white district name floats at the TOP of a 3D pole (the pole itself is drawn in
+   WebGL — see buildLabelGroup). CSS2DRenderer centres the element on the pole's top
+   point; .region-pin lifts the name a few px above that point so it clears the pole.
+   Opacity is driven from JS; the transition makes labels emerge/dissolve elegantly
+   between coarse update ticks. */
+.region-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+  will-change: opacity, transform;
+}
+
+.region-pin {
+  position: absolute;
+  bottom: 4px;               /* lift the name just above the anchor (pole top) */
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.region-name {
+  color: #fff;
+  font: 600 13px/1 system-ui, "PingFang TC", "Noto Sans TC", sans-serif;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.55), 0 0 2px rgba(0, 0, 0, 0.45);
 }

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader }    from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader }   from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { Line2 }                from 'three/examples/jsm/lines/Line2.js';
 import { LineSegments2 }        from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineGeometry }         from 'three/examples/jsm/lines/LineGeometry.js';
@@ -49,6 +50,7 @@ const loadingOverlay  = document.getElementById('loading-overlay');
 const progressFill    = document.getElementById('progress-fill');
 const loadingDetail   = document.getElementById('loading-detail');
 const openMathBtn     = document.getElementById('open-math');
+const debugToggleBtn  = document.getElementById('debug-toggle');
 const closeMathBtn    = document.getElementById('close-math');
 const mathModal       = document.getElementById('math-modal');
 const mathContent     = document.getElementById('math-content');
@@ -63,10 +65,24 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicD
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-// Performance HUD (MS / MB) pinned to the viewport's top-left.
+// Draggable debug HUD (MS / MB / three.js render-info). Hidden until the Debug button.
 const stats = createStats();
 document.body.appendChild(stats.dom);
+debugToggleBtn.addEventListener('click', () => {
+  stats.setVisible(!stats.visible);
+  debugToggleBtn.setAttribute('aria-pressed', String(stats.visible));
+  debugToggleBtn.classList.toggle('active', stats.visible);
+});
 renderer.setPixelRatio(window.devicePixelRatio);
+
+// CSS2D overlay for billboarded region-name labels (admin boundaries). Renders crisp
+// DOM text positioned at projected 3D points — layered above the canvas, below the UI
+// (z-index < the panel/bars), and click-through so it never intercepts pointer events.
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.domElement.id = 'label-layer';
+labelRenderer.domElement.style.cssText =
+  'position:fixed;top:0;left:0;pointer-events:none;z-index:5';
+document.body.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
 // Two looks, switched by colour map (see applyTheme): the default dark backdrop, and the
@@ -282,6 +298,28 @@ let introComplete = false;
 let boundaryGroup = null;
 const BOUNDARY_LIFT = 50; // metres above terrain max (in geometry Y-space)
 
+// Region-name labels (CSS2D pins). Built from boundaries.json names; gated by view
+// distance + frustum + a nearest-N cap so labels emerge near what you're looking at
+// instead of plastering all 379 districts at once.
+/** @type {THREE.Group|null} */
+let labelGroup = null;
+/** @type {THREE.Group|null} */
+let poleGroup = null; // child of labelGroup; one downward unit-pole per label, scaled to the floor
+/** @type {Array<{obj: CSS2DObject, el: HTMLElement, pole: THREE.Line, wx: number, wz: number, d2: number}>} */
+const regionLabels = [];
+// Labels show at ALL altitudes (incl. low-level flight). The look-around radius scales
+// with view distance so density stays sensible: a tight cluster of names up close, a
+// broad sweep when zoomed out. Nearest-to-target + frustum still cap how many appear.
+const LABEL_RADIUS_MIN =  4000; // radius floor (low altitude → only the nearest districts)
+const LABEL_RADIUS_MAX = 60000; // radius ceiling (high altitude → broad labelling)
+const LABEL_RADIUS_K   =   1.4; // radius ≈ view distance × this, clamped to the band above
+const LABEL_MAX_COUNT  =    16; // cap simultaneous labels (nearest-to-target win)
+const LABEL_HEIGHT_FRAC =  0.85; // name rides at this fraction of camera altitude above the floor
+const _labelFrustum = new THREE.Frustum();
+const _labelProjM   = new THREE.Matrix4();
+const _labelPt      = new THREE.Vector3();
+const _camDir       = new THREE.Vector3();
+
 // LOD state
 /** @type {Map<string, THREE.BufferGeometry>} raw geometry cache (avoids re-fetching) */
 const lodCache = new Map();
@@ -390,6 +428,7 @@ function makeFatLineMaterial(color, linewidth, opacity) {
 
 function resize() {
   renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   for (const m of fatLineMaterials) m.resolution.set(window.innerWidth, window.innerHeight);
@@ -437,7 +476,12 @@ topViewBtn.addEventListener('click', cameraTop);
 const keysDown = new Set();
 
 document.addEventListener('keydown', (e) => {
-  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+  // Only swallow keys while typing in a TEXT field. Checkboxes / sliders / selects keep
+  // focus after a click, but must not block WASD/QE flight — they take no text input.
+  const t = e.target;
+  if (t instanceof HTMLTextAreaElement ||
+      (t instanceof HTMLInputElement &&
+       /^(text|search|email|number|password|url|tel)$/.test(t.type))) return;
   keysDown.add(e.key.toLowerCase());
   if (e.key === 'r' || e.key === 'R') cameraReset();
   if (e.key === 't' || e.key === 'T') cameraTop();
@@ -1305,8 +1349,177 @@ const boundaryMat = makeFatLineMaterial(0xffffff, 4.5, 0.9); // white, thicker t
  * terrainBBox.max.y is in geometry space; terrainGroup.scale.y = userZScale stretches it.
  */
 function updateBoundaryY() {
-  if (!boundaryGroup || !terrainBBox) return;
-  boundaryGroup.position.y = terrainBBox.max.y * userZScale + BOUNDARY_LIFT;
+  if (!terrainBBox) return;
+  // Boundary lines stay pinned to the terrain-top plane.
+  if (boundaryGroup) boundaryGroup.position.y = terrainBBox.max.y * userZScale + BOUNDARY_LIFT;
+  updateLabelHeight();
+}
+
+/**
+ * Region-name height tracking, accounting for both camera altitude AND pitch so the names
+ * stay in view however the camera is angled:
+ *   • Looking level  → names ride near the camera altitude (LABEL_HEIGHT_FRAC), following it.
+ *   • Looking down   → names drop toward the terrain floor, the spot the camera is aimed at,
+ *                      so they don't slide off the top of the screen.
+ * The pitch weight is the camera forward vector's downward component (0 = level, 1 = straight
+ * down). The pole always runs from the name down to the floor, shortening as the name drops.
+ * Called every frame for smooth tracking; cheap.
+ */
+function updateLabelHeight() {
+  if (!labelGroup || !terrainBBox) return;
+  const floorY = terrainBBox.min.y * userZScale;
+  camera.getWorldDirection(_camDir);
+  const pitch = Math.min(1, Math.max(0, -_camDir.y)); // 0 = level, 1 = looking straight down
+  const high  = floorY + (camera.position.y - floorY) * LABEL_HEIGHT_FRAC; // level: follow camera
+  const low   = floorY + 100;                                              // down: sit near ground
+  const y = high + (low - high) * pitch;
+  labelGroup.position.y = y;
+  if (poleGroup) poleGroup.scale.y = Math.max(1, y - floorY); // keep the pole base at the floor
+}
+
+/**
+ * Signed-area centroid of a closed ring via the shoelace formula. Returns
+ * `[cx, cz, area]` (area magnitude used to pick the largest part of a multipolygon).
+ * Falls back to the vertex mean for degenerate (near-zero-area) rings.
+ *
+ *   A   = ½ Σ (xᵢ·zᵢ₊₁ − xᵢ₊₁·zᵢ)
+ *   Cx  = 1/(6A) Σ (xᵢ + xᵢ₊₁)(xᵢ·zᵢ₊₁ − xᵢ₊₁·zᵢ)
+ *
+ * @param {Array<[number, number]>} ring
+ * @returns {[number, number, number]}
+ */
+function ringCentroid(ring) {
+  let a = 0, cx = 0, cz = 0;
+  for (let i = 0, n = ring.length; i < n; i++) {
+    const [x0, z0] = ring[i];
+    const [x1, z1] = ring[(i + 1) % n];
+    const cross = x0 * z1 - x1 * z0;
+    a  += cross;
+    cx += (x0 + x1) * cross;
+    cz += (z0 + z1) * cross;
+  }
+  a *= 0.5;
+  if (Math.abs(a) < 1e-6) {
+    let sx = 0, sz = 0;
+    for (const [x, z] of ring) { sx += x; sz += z; }
+    return [sx / ring.length, sz / ring.length, 0];
+  }
+  return [cx / (6 * a), cz / (6 * a), Math.abs(a)];
+}
+
+/**
+ * Build one CSS2D pin label per district. Districts spanning several rings
+ * (multipolygon, e.g. 蘭嶼鄉) are merged by name; the label anchors at the centroid
+ * of the district's largest-area ring. Each pin is a billboarded element: the white
+ * region name above a thin gradient "stem" line that points down at the anchor.
+ *
+ * @param {Array<Array<[number, number]>>} rings
+ * @param {string[]} names  parallel to rings
+ * @returns {THREE.Group}
+ */
+function buildLabelGroup(rings, names) {
+  // Per name, keep the centroid of the largest-area ring seen so far.
+  const best = new Map(); // name → {cx, cz, area}
+  for (let i = 0; i < rings.length; i++) {
+    const ring = rings[i];
+    const name = names[i];
+    if (!name || !ring || ring.length < 3) continue;
+    const [cx, cz, area] = ringCentroid(ring);
+    const prev = best.get(name);
+    if (!prev || area > prev.area) best.set(name, { cx, cz, area });
+  }
+
+  const group = new THREE.Group();
+  poleGroup = new THREE.Group(); // unit-down poles; scaled to the floor in updateBoundaryY
+  group.add(poleGroup);
+
+  for (const [name, { cx, cz }] of best) {
+    const el = document.createElement('div');
+    el.className = 'region-label';
+    // CSS2DRenderer centres `el` on the anchor (pole top); .region-pin lifts the name
+    // just above it so the name floats at the top of the pole — see style.css.
+    el.innerHTML = `<div class="region-pin"><span class="region-name">${name}</span></div>`;
+    const obj = new CSS2DObject(el);
+    obj.position.set(cx, 0, cz);
+    obj.visible = false;        // gated on by updateRegionLabels()
+    obj.center.set(0.5, 0.5);   // anchor element centre on the point
+
+    // 3D pole: a unit segment from the boundary plane straight down (y: 0 → −1). The
+    // parent poleGroup's y-scale stretches it to the terrain floor (updateBoundaryY).
+    // depthTest off + high renderOrder keeps it visible over terrain, like the label.
+    const poleGeom = new THREE.BufferGeometry();
+    poleGeom.setAttribute('position', new THREE.Float32BufferAttribute(
+      [cx, 0, cz, cx, -1, cz], 3));
+    const poleMat = new THREE.LineBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0, depthTest: false, depthWrite: false,
+    });
+    const pole = new THREE.Line(poleGeom, poleMat);
+    pole.renderOrder = 998;
+    pole.frustumCulled = false;
+    pole.visible = false;
+    poleGroup.add(pole);
+
+    group.add(obj);
+    regionLabels.push({ obj, el, pole, wx: cx, wz: cz, d2: 0 });
+  }
+  return group;
+}
+
+/** Smoothstep easing on [edge0, edge1] → [0, 1]. */
+function smoothstep(edge0, edge1, x) {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Per-frame visibility + opacity for region labels. Labels emerge once the camera is
+ * a comfortable distance from its look-at target (a global fade envelope), then only
+ * the nearest-N in-frustum districts within LABEL_RADIUS of the target are shown — so
+ * the names appear around whatever you're looking at without cluttering the whole map.
+ * Smoothness comes from a CSS opacity transition (see .region-label in style.css).
+ */
+function updateRegionLabels() {
+  if (!labelGroup) return;
+  const hide = (m) => {
+    if (m.obj.visible) { m.obj.visible = false; m.el.style.opacity = '0'; }
+    if (m.pole.visible) { m.pole.visible = false; m.pole.material.opacity = 0; }
+  };
+  if (!boundariesToggle.checked) { for (const m of regionLabels) hide(m); return; }
+
+  // Look-around radius scales with view distance (clamped) so labels stay readable at
+  // every altitude — a tight cluster up close, a broad sweep when zoomed out.
+  const viewDist = camera.position.distanceTo(controls.target);
+  const radius = Math.min(LABEL_RADIUS_MAX, Math.max(LABEL_RADIUS_MIN, viewDist * LABEL_RADIUS_K));
+  const r2 = radius * radius;
+
+  _labelProjM.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _labelFrustum.setFromProjectionMatrix(_labelProjM);
+  const tx = controls.target.x, tz = controls.target.z;
+  const planeY = labelGroup.position.y;
+
+  // Gather candidates: within radius of the look-at target AND inside the frustum.
+  const candidates = [];
+  for (const m of regionLabels) {
+    const dx = m.wx - tx, dz = m.wz - tz;
+    const d2 = dx * dx + dz * dz;
+    if (d2 > r2) { hide(m); continue; }
+    _labelPt.set(m.wx, planeY, m.wz);
+    if (!_labelFrustum.containsPoint(_labelPt)) { hide(m); continue; }
+    m.d2 = d2;
+    candidates.push(m);
+  }
+  candidates.sort((a, b) => a.d2 - b.d2);
+
+  for (let i = 0; i < candidates.length; i++) {
+    const m = candidates[i];
+    if (i >= LABEL_MAX_COUNT) { hide(m); continue; }
+    // Radial fade near the outer radius so labels dissolve rather than pop at the edge.
+    const opacity = 1 - smoothstep(radius * 0.7, radius, Math.sqrt(m.d2));
+    m.obj.visible = true;
+    m.el.style.opacity = opacity.toFixed(3);
+    m.pole.visible = true;
+    m.pole.material.opacity = opacity * 0.8; // pole a touch fainter than the name
+  }
 }
 
 /**
@@ -1349,6 +1562,8 @@ fetch(BASE + 'boundaries.json')
   .then((data) => {
     boundaryGroup = buildBoundaryGroup(data.rings ?? []);
     boundaryGroup.visible = boundariesToggle.checked;
+    labelGroup = buildLabelGroup(data.rings ?? [], data.names ?? []);
+    scene.add(labelGroup);
     updateBoundaryY();
     scene.add(boundaryGroup);
   })
@@ -1358,6 +1573,7 @@ fetch(BASE + 'boundaries.json')
 
 boundariesToggle.addEventListener('change', () => {
   if (boundaryGroup) boundaryGroup.visible = boundariesToggle.checked;
+  if (!boundariesToggle.checked) updateRegionLabels(); // hide labels immediately
 });
 
 // One "Shader" switch: terrain hillshade + cast shadows (terrain & buildings).
@@ -1720,6 +1936,10 @@ let lastFrameTime = 0;
 
   controls.update();
 
+  // Region names descend with the camera once it dips below the boundary plane (cheap;
+  // every frame so it tracks smoothly during low-level flight).
+  if (labelGroup && boundariesToggle.checked) updateLabelHeight();
+
   // LOD check once per ~60 frames; skip during intro orbit to avoid racing the first load
   if (++lodFrameCount % 60 === 0 && terrainBBox && introComplete) {
     const target = targetLodUrl();
@@ -1728,11 +1948,16 @@ let lastFrameTime = 0;
 
   // Tiled-LOD streaming: more frequent than LOD (camera focus moves continuously)
   if (++detailFrameCount % 15 === 0 && introComplete) updateTiles();
-  if (++buildingFrameCount % 20 === 0 && introComplete) { updateBuildings(); updateRivers(); }
+  if (++buildingFrameCount % 20 === 0 && introComplete) {
+    updateBuildings();
+    updateRivers();
+    updateRegionLabels(); // CSS transition smooths the fade between these coarse ticks
+  }
 
   renderer.render(scene, camera);
+  labelRenderer.render(scene, camera); // CSS2D region-name pins over the main scene
+  stats.end(renderer); // before renderGizmo so renderer.info reflects the main scene
   renderGizmo();
-  stats.end();
 }(0));
 
 // ── Modal content ─────────────────────────────────────────────────────────────────
@@ -1780,6 +2005,19 @@ baked Z-scale factor stored in the file's <code>extras</code>.</p>
 //   [ positions (VEC3 FLOAT) | normals (VEC3 FLOAT) | indices (SCALAR UINT) ]</code></pre>
 <p>The mesh is self-contained: one file, no external textures, no streaming
 protocol — just structured binary data and a JSON header.</p>
+
+<h3>Debug HUD (🐞)</h3>
+<p>The 🐞 button toggles a draggable performance overlay:</p>
+<ul>
+<li><code>FPS</code> — frames rendered per second (capped by the display refresh; 60 is typical).</li>
+<li><code>MS</code> — milliseconds of work per frame; under ~16.7 ms sustains 60 FPS.</li>
+<li><code>MB</code> — JS heap memory in use (Chromium only).</li>
+<li><code>tris</code> — triangles drawn this frame; climbs as detail tiles &amp; buildings stream in.</li>
+<li><code>draws</code> — draw calls per frame (≈ one per visible tile/overlay; fewer is cheaper).</li>
+<li><code>geo</code> — GPU geometries allocated; should rise &amp; fall with streaming, never grow unbounded (leak check).</li>
+<li><code>tex</code> — GPU textures (≈ 0 here — surfaces are flat-coloured, untextured).</li>
+<li><code>prog</code> — cached compiled shader programs; a small constant. A climbing count means shader recompiles (jank).</li>
+</ul>
 `,
   zhTW: `
 <p>本工具將台灣 DTM（數值地形模型）以 GLB 格式渲染。GLB 是 glTF 2.0 二進位格式，
@@ -1822,6 +2060,19 @@ Z_{\\text{GLB}} = -(N - N_0)$$</p>
 //   [ positions (VEC3 FLOAT) | normals (VEC3 FLOAT) | indices (SCALAR UINT) ]</code></pre>
 <p>整個網格自包含於單一檔案中：不需外部貼圖、不需串流協定，
 只有結構化二進位資料加上 JSON 描述器。</p>
+
+<h3>除錯 HUD（🐞）</h3>
+<p>點 🐞 按鈕開關可拖動的效能浮層，各欄位意義：</p>
+<ul>
+<li><code>FPS</code> — 每秒算繪幀數（受螢幕更新率上限，通常 60）。</li>
+<li><code>MS</code> — 每幀耗時（毫秒）；低於約 16.7 ms 才能維持 60 FPS。</li>
+<li><code>MB</code> — 使用中的 JS heap 記憶體（僅 Chromium 支援）。</li>
+<li><code>tris</code> — 本幀繪製的三角形數；細節圖磚與建築串流進來時上升。</li>
+<li><code>draws</code> — 每幀 draw call 數（每個可見圖磚/疊層約一個，越少越省）。</li>
+<li><code>geo</code> — GPU 上配置的幾何數；應隨串流上下，不應無限增長（抓記憶體洩漏）。</li>
+<li><code>tex</code> — GPU 貼圖數（本專案趨近 0，表面為純色無貼圖）。</li>
+<li><code>prog</code> — 已快取的已編譯 shader program 數；應為小常數。持續攀升代表 shader 重編（卡頓來源）。</li>
+</ul>
 `,
 };
 
