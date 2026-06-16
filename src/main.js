@@ -807,8 +807,10 @@ function loadTile(tile, level) {
       if (isDetail && baseTiles.has(tile.key)) disposeTile(baseTiles, baseTileGroup, tile.key);
       group.add(m);
       map.set(tile.key, m);
-      // Build per-tile 20 m height grid and schedule road elevation rebake.
-      if (isDetail) {
+      // Build per-tile 20 m height grid + schedule road rebake ONLY when roads are
+      // live — otherwise this fires on every tile during low flight for hidden roads
+      // (the terrain-only stutter). Backfilled when roads are toggled on.
+      if (isDetail && roadsActive()) {
         detailTileGrids.set(tile.key, buildDetailTileGrid(mesh.geometry));
         scheduleRoadRebake();
       }
@@ -1368,8 +1370,18 @@ const ROAD_LIFT = 20;
  * Vertex local-Y = raw terrain elevation; roadGroup.scale.y = userZScale
  * → world_Y = ROAD_LIFT + userZScale × elevation, matching the terrain transform.
  */
+/**
+ * Roads incur streaming cost (per-tile height grid + full road-geometry rebake) only
+ * when loaded AND visible. Gating on this keeps terrain-only low-altitude flight smooth:
+ * roads default off, yet the geometry is eagerly loaded, so `roadLayers.size` alone never
+ * skips the work — the visibility check does.
+ */
+function roadsActive() {
+  return roadGroup != null && roadsToggle.checked;
+}
+
 function applyRoadElevations() {
-  if (!terrainHeightGrid || roadLayers.size === 0) return;
+  if (!terrainHeightGrid || roadLayers.size === 0 || !roadsActive()) return;
   for (const [, line] of roadLayers) {
     const { flat, positions } = line.userData;
     const edgeCount = flat.length / 4;
@@ -1447,6 +1459,14 @@ fetch(BASE + 'roads.json')
 roadsToggle.addEventListener('change', () => {
   if (roadGroup) roadGroup.visible = roadsToggle.checked;
   roadsSub.hidden = !roadsToggle.checked;
+  if (roadsToggle.checked) {
+    // Grids/rebake were skipped while roads were hidden — backfill resident detail
+    // tiles, then bake road Y once against the now-available 20 m grids.
+    for (const [key, m] of detailTiles) {
+      if (!detailTileGrids.has(key)) detailTileGrids.set(key, buildDetailTileGrid(m.geometry));
+    }
+    applyRoadElevations();
+  }
 });
 /** @param {string} key @param {boolean} v */
 function setRoadLayerVisible(key, v) {
