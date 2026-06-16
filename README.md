@@ -179,17 +179,30 @@ The 內政部 township shapefile is delivered in geographic TWD97 (degrees). The
    z = -(Northing - y_center)
    ```
 
-5. Writes `output/boundaries.json` — an array of `[x, z]` rings with district names.
+5. With `--dtm`, bakes a per-vertex terrain height from a `TerrainSampler` (`E = x + x_center`,
+   `N = y_center − z` inverts the mapping to look up the DTM) so the lines **drape on the terrain**
+   exactly like the baked roads — same offline philosophy, no runtime raycasting.
+6. Writes `output/boundaries.json` — rings of `[x, y, z]` (or `[x, z]` without `--dtm`) plus a
+   parallel `names` array (district name per ring; multipolygon parts repeat the name).
 
-In Three.js, each ring becomes a `THREE.LineLoop`. The boundary `Group` is parented directly to
-the scene and its Y position is updated whenever the terrain loads or Z-scale changes:
+In Three.js, each ring becomes a closed `Line2` (fat line). The baked Y drapes it on the surface;
+the boundary `Group` only needs a small lift + the live Z-scale (mirrors `updateRoadY`):
 
 ```js
-boundaryGroup.position.y = terrainBBox.max.y * userZScale + BOUNDARY_LIFT;
+boundaryGroup.position.y = BOUNDARY_LIFT; // 50 m, clears z-fighting; sits above roads' 20 m
+boundaryGroup.scale.y    = userZScale;
 ```
 
-This keeps the lines floating 50 m above the highest terrain point regardless of the Z-scale
-setting, without requiring per-vertex terrain raycasting.
+Lines are depth-tested, so ridges occlude boundaries behind them at low angles — the natural,
+draped look (the same trade-off as roads).
+
+**Region-name labels.** When the layer is on, district names appear as billboarded CSS2D pins
+(`CSS2DRenderer`): the white name floats at the top of a thin WebGL pole that drops to the terrain
+floor. Each name anchors at the centroid of its district's largest ring (shoelace formula, merged
+by name across multipolygon parts). Visibility is gated by a view-distance-scaled radius + frustum
++ a nearest-N cap so labels emerge around the look-at point instead of flooding all 379 districts.
+The name height tracks the camera's altitude **and pitch** (level → near camera height; looking
+down → toward the ground) so it always stays in view; opacity fades via a CSS transition.
 
 ---
 

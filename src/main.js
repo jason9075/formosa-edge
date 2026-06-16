@@ -296,7 +296,7 @@ let introComplete = false;
 // Boundary overlay state
 /** @type {THREE.Group|null} */
 let boundaryGroup = null;
-const BOUNDARY_LIFT = 50; // metres above terrain max (in geometry Y-space)
+const BOUNDARY_LIFT = 50; // small lift above the draped terrain surface (clears z-fighting; sits above roads' 20 m)
 
 // Region-name labels (CSS2D pins). Built from boundaries.json names; gated by view
 // distance + frustum + a nearest-N cap so labels emerge near what you're looking at
@@ -1349,9 +1349,13 @@ const boundaryMat = makeFatLineMaterial(0xffffff, 4.5, 0.9); // white, thicker t
  * terrainBBox.max.y is in geometry space; terrainGroup.scale.y = userZScale stretches it.
  */
 function updateBoundaryY() {
-  if (!terrainBBox) return;
-  // Boundary lines stay pinned to the terrain-top plane.
-  if (boundaryGroup) boundaryGroup.position.y = terrainBBox.max.y * userZScale + BOUNDARY_LIFT;
+  // Boundary rings carry per-vertex terrain height baked offline (shp_to_json.py --dtm),
+  // so they drape on the terrain like roads: a small lift to clear z-fighting + the live
+  // Z-Scale. (Older 2D boundaries.json has Y=0 → this lays it flat at BOUNDARY_LIFT.)
+  if (boundaryGroup) {
+    boundaryGroup.position.y = BOUNDARY_LIFT;
+    boundaryGroup.scale.y = userZScale;
+  }
   updateLabelHeight();
 }
 
@@ -1389,10 +1393,11 @@ function updateLabelHeight() {
  * @returns {[number, number, number]}
  */
 function ringCentroid(ring) {
+  const zi = ring[0].length - 1; // z is the last component: index 1 (2D) or 2 (3D, Y baked)
   let a = 0, cx = 0, cz = 0;
   for (let i = 0, n = ring.length; i < n; i++) {
-    const [x0, z0] = ring[i];
-    const [x1, z1] = ring[(i + 1) % n];
+    const x0 = ring[i][0],          z0 = ring[i][zi];
+    const x1 = ring[(i + 1) % n][0], z1 = ring[(i + 1) % n][zi];
     const cross = x0 * z1 - x1 * z0;
     a  += cross;
     cx += (x0 + x1) * cross;
@@ -1401,7 +1406,7 @@ function ringCentroid(ring) {
   a *= 0.5;
   if (Math.abs(a) < 1e-6) {
     let sx = 0, sz = 0;
-    for (const [x, z] of ring) { sx += x; sz += z; }
+    for (const p of ring) { sx += p[0]; sz += p[zi]; }
     return [sx / ring.length, sz / ring.length, 0];
   }
   return [cx / (6 * a), cz / (6 * a), Math.abs(a)];
@@ -1523,11 +1528,11 @@ function updateRegionLabels() {
 }
 
 /**
- * Build a THREE.Group of LineLoops from the rings array in boundaries.json.
- * Each vertex is [x, z] in Three.js local space; Y is set to 0 and the group
- * is translated via updateBoundaryY().
+ * Build a THREE.Group of closed fat-line loops from the rings array in boundaries.json.
+ * Each vertex is [x, z] (2D, flat) or [x, y, z] (3D, terrain height baked offline). The
+ * baked Y drapes the ring on the terrain; the group is lifted + Z-scaled via updateBoundaryY().
  *
- * @param {Array<Array<[number, number]>>} rings
+ * @param {Array<Array<number[]>>} rings
  * @returns {THREE.Group}
  */
 function buildBoundaryGroup(rings) {
@@ -1535,14 +1540,14 @@ function buildBoundaryGroup(rings) {
   for (const ring of rings) {
     if (ring.length < 2) continue;
     const n = ring.length;
+    const is3D = ring[0].length >= 3; // [x,y,z] (draped) vs [x,z] (flat)
     const positions = new Float32Array((n + 1) * 3); // +1 repeats the first vertex (Line2 has no LineLoop)
-    for (let i = 0; i < n; i++) {
-      positions[i * 3]     = ring[i][0];
-      positions[i * 3 + 1] = 0;
-      positions[i * 3 + 2] = ring[i][1];
+    for (let i = 0; i <= n; i++) {
+      const v = ring[i % n];
+      positions[i * 3]     = v[0];
+      positions[i * 3 + 1] = is3D ? v[1] : 0;
+      positions[i * 3 + 2] = is3D ? v[2] : v[1];
     }
-    positions[n * 3] = ring[0][0];
-    positions[n * 3 + 2] = ring[0][1];
     const geom = new LineGeometry();
     geom.setPositions(positions);
     const line = new Line2(geom, boundaryMat);

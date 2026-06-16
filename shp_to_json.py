@@ -22,6 +22,8 @@ import shapefile
 from pyproj import Transformer
 from shapely.geometry import LineString
 
+from buildings_to_glb import TerrainSampler
+
 
 def read_glb_meta(glb_path: Path) -> dict:
     """Read extras (x_center, y_center) and POSITION accessor bbox from GLB JSON chunk."""
@@ -64,6 +66,16 @@ def main() -> None:
         '--simplify', type=float, default=1.0, metavar='M',
         help='Douglas-Peucker tolerance in metres (0 = off); coords also rounded to 1 m',
     )
+    parser.add_argument(
+        '--dtm', type=Path, default=None,
+        help='DTM raw/ dir to bake per-vertex terrain height into the rings (3D output, '
+             'so the viewer drapes boundaries on the terrain instead of a floating plane)',
+    )
+    parser.add_argument(
+        '--dtm-step', type=int, default=2, metavar='N',
+        help='DTM decimation for the height sampler (2 = 40 m). Boundaries are smooth, so '
+             'a coarse sampler is plenty (default 2)',
+    )
     args = parser.parse_args()
 
     # ── Read GLB metadata ───────────────────────────────────────────────────────
@@ -80,6 +92,12 @@ def main() -> None:
     N_max = -meta['glb_zmin'] + yc + args.margin
     print(f'  Terrain TWD97 extent: E[{E_min:.0f}, {E_max:.0f}]  N[{N_min:.0f}, {N_max:.0f}]')
     print(f'  Origin centroid: x_center={xc:.1f}  y_center={yc:.1f}')
+
+    # ── Terrain height sampler (optional, for draped 3D rings) ───────────────────
+    sampler = None
+    if args.dtm:
+        print(f'Building terrain sampler (step {args.dtm_step}) from {args.dtm}…')
+        sampler = TerrainSampler(args.dtm, step=args.dtm_step)
 
     # ── Coordinate transformer ──────────────────────────────────────────────────
     # GCS_TWD97[2020] (lon/lat, degrees) → EPSG:3826 (TM2 metres)
@@ -141,8 +159,16 @@ def main() -> None:
                 if len(local) < 3:
                     skipped += 1
                     continue
-            # round() → 1 m integers (no ".x" decimals → smaller JSON)
-            ring = [[round(x), round(z)] for x, z in local]
+            # round() → 1 m integers (no ".x" decimals → smaller JSON). With --dtm, bake
+            # Y = terrain elevation per vertex so the viewer drapes the ring on the terrain
+            # (E = x + xc, N = yc − z inverts the local-space mapping above to sample the DTM).
+            if sampler:
+                ring = []
+                for x, z in local:
+                    h = sampler.height(x + xc, yc - z)
+                    ring.append([round(x), round(h if h is not None else sampler._fallback), round(z)])
+            else:
+                ring = [[round(x), round(z)] for x, z in local]
             rings.append(ring)
             names.append(name)
 

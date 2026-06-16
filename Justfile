@@ -93,8 +93,10 @@ convert-roads:
 
 # Extract township boundary rings from shapefile → output/boundaries.json
 # --simplify 5: 5 m Douglas-Peucker (imperceptible from altitude, ~halves the file)
+# --dtm: bake per-vertex terrain height so the viewer drapes boundaries on the terrain
+#        (3D rings, ~1.5× the file) instead of floating them on a flat plane
 convert-boundaries:
-    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taiwan_100m.glb output/boundaries.json --simplify 5
+    python3 shp_to_json.py line/TOWN_MOI_1140318.shp output/taiwan_100m.glb output/boundaries.json --simplify 5 --dtm {{data_dir}} --dtm-step 2
 
 # 100m + 2× elevation exaggeration
 convert-exag:
