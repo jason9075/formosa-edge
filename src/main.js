@@ -52,6 +52,8 @@ const progressFill    = document.getElementById('progress-fill');
 const loadingDetail   = document.getElementById('loading-detail');
 const openMathBtn     = document.getElementById('open-math');
 const debugToggleBtn  = document.getElementById('debug-toggle');
+const measureToggleBtn = document.getElementById('measure-toggle');
+const measureReadout   = document.getElementById('measure-readout');
 const closeMathBtn    = document.getElementById('close-math');
 const mathModal       = document.getElementById('math-modal');
 const mathContent     = document.getElementById('math-content');
@@ -331,6 +333,16 @@ const sunUniforms = {
 // World-space sun direction; matches dirLight.position by default (NW sun at 45°)
 let sunDirWorld = new THREE.Vector3(-1, 1.2, -1).normalize();
 
+// ── Measure / bounding-box highlight uniforms ────────────────────────────────────
+// Injected into buildingMat (see onBeforeCompile below). Bounds are world-space XZ
+// (GLB X = E - xCenter, GLB Z = -(N - yCenter)); fragments inside tint red. Mutate
+// .value in-place — no recompile, no per-frame work while the box is static.
+const measureUniforms = {
+  uMeasureActive: { value: 0.0 },                    // 0 = off, 1 = highlight
+  uMeasureMin:    { value: new THREE.Vector2(0, 0) }, // (minX, minZ) world metres
+  uMeasureMax:    { value: new THREE.Vector2(0, 0) }, // (maxX, maxZ) world metres
+};
+
 // ── State ────────────────────────────────────────────────────────────────────────
 /** @type {THREE.Mesh[]} */
 let terrainMeshes = [];
@@ -459,6 +471,36 @@ let buildingFrameCount = 0;
 const buildingMat = new THREE.MeshStandardMaterial({
   color: 0xffffff, roughness: 0.92, metalness: 0.0, side: THREE.FrontSide,
 });
+// Inject a world-space bbox highlight: fragments whose XZ falls inside the measured
+// box are tinted red. Per-fragment (≈ per-building) across every tile from one shared
+// material — no per-mesh material swapping or geometry splitting needed.
+buildingMat.onBeforeCompile = (shader) => {
+  shader.vertexShader = 'varying vec3 vWorldPosB;\n' + shader.vertexShader;
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <project_vertex>',
+    '#include <project_vertex>\nvWorldPosB = (modelMatrix * vec4(transformed, 1.0)).xyz;'
+  );
+  shader.fragmentShader = [
+    'varying vec3 vWorldPosB;',
+    'uniform float uMeasureActive;',
+    'uniform vec2  uMeasureMin;',
+    'uniform vec2  uMeasureMax;',
+    shader.fragmentShader,
+  ].join('\n');
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <dithering_fragment>',
+    `{
+  if (uMeasureActive > 0.5 &&
+      vWorldPosB.x >= uMeasureMin.x && vWorldPosB.x <= uMeasureMax.x &&
+      vWorldPosB.z >= uMeasureMin.y && vWorldPosB.z <= uMeasureMax.y) {
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.90, 0.12, 0.10), 0.78);
+  }
+}
+#include <dithering_fragment>`
+  );
+  Object.assign(shader.uniforms, measureUniforms);
+};
+buildingMat.customProgramCacheKey = () => 'building-measure-v1';
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
 function setPanelOpen(open) {
@@ -586,7 +628,219 @@ canvas.addEventListener('mousemove', (e) => {
   } else {
     coordHud.textContent = 'E: —  N: —  ▲ —';
   }
+  // Grab cursor + outline when hovering a draggable marker (skip mid-drag — that's 'grabbing').
+  if (measureState === 'active' && !draggingMarker) {
+    const hovered = raycaster.intersectObjects(measureGroup.children, false)[0]?.object ?? null;
+    canvas.style.cursor = hovered ? 'grab' : '';
+    for (const mk of measureGroup.children) mk.userData.outline.visible = (mk === hovered);
+  }
   nudgeHint();
+});
+
+// ── Bounding-box measure tool ──────────────────────────────────────────────────────
+// State: 'idle' → 'first' (placing pt 1) → 'second' (placing pt 2) → 'active' (box shown,
+// buildings highlighted). The measure button advances idle→first and, from any other
+// state, cancels back to idle. Markers are picked by raycasting the terrain (same as the
+// coordinate HUD), so the points carry world-space metres directly.
+
+/**
+ * Inverse Transverse-Mercator (TWD97 / TM2 → WGS84). Main-island zone only:
+ * central meridian 121°E, k0 = 0.9999, false easting 250 000 m, GRS80 ellipsoid.
+ * Outlying islands (119°E zone) are excluded from this map, so 121° is always correct.
+ * @param {number} E TWD97 easting (m) @param {number} N TWD97 northing (m)
+ * @returns {{lat:number, lon:number}} degrees
+ */
+function twd97ToWgs84(E, N) {
+  const a = 6378137.0, f = 1 / 298.257222101;
+  const k0 = 0.9999, lon0 = 121 * Math.PI / 180, FE = 250000, FN = 0;
+  const e2 = f * (2 - f), ep2 = e2 / (1 - e2);
+  const M = (N - FN) / k0;
+  const mu = M / (a * (1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 ** 3 / 256));
+  const e1 = (1 - Math.sqrt(1 - e2)) / (1 + Math.sqrt(1 - e2));
+  const fp = mu
+    + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * Math.sin(2 * mu)
+    + (21 * e1 * e1 / 16 - 55 * e1 ** 4 / 32) * Math.sin(4 * mu)
+    + (151 * e1 ** 3 / 96) * Math.sin(6 * mu)
+    + (1097 * e1 ** 4 / 512) * Math.sin(8 * mu);
+  const sinf = Math.sin(fp), cosf = Math.cos(fp), tanf = Math.tan(fp);
+  const C1 = ep2 * cosf * cosf;
+  const T1 = tanf * tanf;
+  const N1 = a / Math.sqrt(1 - e2 * sinf * sinf);
+  const R1 = a * (1 - e2) / (1 - e2 * sinf * sinf) ** 1.5;
+  const D = (E - FE) / (N1 * k0);
+  const lat = fp - (N1 * tanf / R1) * (D * D / 2
+    - (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * ep2) * D ** 4 / 24
+    + (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * ep2 - 3 * C1 * C1) * D ** 6 / 720);
+  const lon = lon0 + (D
+    - (1 + 2 * T1 + C1) * D ** 3 / 6
+    + (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * ep2 + 24 * T1 * T1) * D ** 5 / 120) / cosf;
+  return { lat: lat * 180 / Math.PI, lon: lon * 180 / Math.PI };
+}
+
+/** @type {'idle'|'first'|'second'|'active'} */
+let measureState = 'idle';
+/** @type {THREE.Vector3[]} world-space picked points */
+const measurePoints = [];
+const measureGroup = new THREE.Group();
+scene.add(measureGroup);
+// Bright-yellow square pyramid — strong emissive so it stays vivid in any lighting.
+const markerMat = new THREE.MeshStandardMaterial({
+  color: 0xffee00, metalness: 0.2, roughness: 0.4,
+  emissive: 0xffd400, emissiveIntensity: 0.45,
+});
+// Unit pyramid (apex at the local origin, pointing down; base rises +Y). Shared across
+// markers; per-frame scaling in the animate loop keeps a near-constant on-screen size.
+const markerGeom = new THREE.ConeGeometry(0.45, 1, 4);
+markerGeom.rotateX(Math.PI);     // apex points down (−Y)
+markerGeom.translate(0, 0.5, 0); // apex at origin → marker grows upward from the picked point
+
+// Hover outline: a crisp fat-line edge cage. Constant pixel width at any zoom (screen-space
+// linewidth) and uniform thickness — unlike the inverted-hull, which thinned toward the apex.
+// Self-contained: no post-processing pass to disturb the stencil / log-depth / gizmo setup.
+const markerEdges = new LineSegmentsGeometry().fromEdgesGeometry(new THREE.EdgesGeometry(markerGeom));
+const outlineMat = makeFatLineMaterial(0xffffff, 2.5, 1.0);
+outlineMat.depthTest = false; // draw the cage on top as a selection highlight
+
+/** Build a yellow pyramid marker anchored at a world-space point (spins + floats in animate). */
+function makeMarker(point) {
+  const m = new THREE.Mesh(markerGeom, markerMat);
+  m.position.copy(point);
+  const outline = new LineSegments2(markerEdges, outlineMat); // child → inherits scale/rotation/float
+  outline.visible = false;     // shown only while hovered/dragged
+  outline.renderOrder = 5;     // over the marker + scene
+  m.add(outline);
+  m.userData.outline = outline;
+  return m;
+}
+
+function fmtLatLon(lat, lon) {
+  const ns = lat >= 0 ? 'N' : 'S';
+  const ew = lon >= 0 ? 'E' : 'W';
+  return `${Math.abs(lat).toFixed(5)}°${ns} ${Math.abs(lon).toFixed(5)}°${ew}`;
+}
+
+function setMeasureReadout(text) {
+  if (text == null) { measureReadout.hidden = true; measureReadout.textContent = ''; }
+  else { measureReadout.textContent = text; measureReadout.hidden = false; }
+}
+
+/** Compute the bbox from the two picked points; update the shader highlight + header. */
+function finishMeasure() {
+  const [p1, p2] = measurePoints;
+  const minX = Math.min(p1.x, p2.x), maxX = Math.max(p1.x, p2.x);
+  const minZ = Math.min(p1.z, p2.z), maxZ = Math.max(p1.z, p2.z);
+
+  // Drive the building highlight (world-space XZ).
+  measureUniforms.uMeasureMin.value.set(minX, minZ);
+  measureUniforms.uMeasureMax.value.set(maxX, maxZ);
+  measureUniforms.uMeasureActive.value = 1.0;
+
+  // World XZ → TWD97 (E = x + xCenter, N = -z + yCenter) → WGS84.
+  const xC = glbMeta.x_center ?? 0, yC = glbMeta.y_center ?? 0;
+  const Emin = minX + xC, Emax = maxX + xC;
+  const Nmin = -maxZ + yC, Nmax = -minZ + yC; // -z, so min z → max N
+  const sw = twd97ToWgs84(Emin, Nmin); // south-west corner (min lat, min lon)
+  const ne = twd97ToWgs84(Emax, Nmax); // north-east corner (max lat, max lon)
+  const wKm = ((Emax - Emin) / 1000).toFixed(2);
+  const hKm = ((Nmax - Nmin) / 1000).toFixed(2);
+  setMeasureReadout(`SW ${fmtLatLon(sw.lat, sw.lon)}  ·  NE ${fmtLatLon(ne.lat, ne.lon)}  ·  ${wKm}×${hKm} km`);
+}
+
+/** Reset the tool to idle: drop markers, clear highlight, hide the readout. */
+function clearMeasure() {
+  measureState = 'idle';
+  measurePoints.length = 0;
+  // Markers share markerGeom (reused for the lifetime of the page) — remove only.
+  for (const c of [...measureGroup.children]) measureGroup.remove(c);
+  // Restore interaction state in case the tool was cancelled mid-drag.
+  draggingMarker = null;
+  controls.enabled = true;
+  canvas.style.cursor = '';
+  measureUniforms.uMeasureActive.value = 0.0;
+  setMeasureReadout(null);
+  measureToggleBtn.classList.remove('active');
+  measureToggleBtn.setAttribute('aria-pressed', 'false');
+}
+
+measureToggleBtn.addEventListener('click', () => {
+  if (measureState === 'idle') {
+    measureState = 'first';
+    measureToggleBtn.classList.add('active');
+    measureToggleBtn.setAttribute('aria-pressed', 'true');
+    setMeasureReadout('Click the terrain to set point 1 of 2');
+  } else {
+    clearMeasure(); // any active state → cancel everything
+  }
+});
+
+// Distinguish a genuine click from a pan-drag: track the pointer-down position and
+// ignore the click if it moved more than a few pixels (OrbitControls fires a click
+// at the end of a left-drag pan).
+let measureDownX = 0, measureDownY = 0;
+/** @type {THREE.Mesh|null} marker currently being dragged */
+let draggingMarker = null;
+
+canvas.addEventListener('pointerdown', (e) => {
+  measureDownX = e.clientX;
+  measureDownY = e.clientY;
+  // Grab a marker to drag it horizontally across the terrain (active state only).
+  if (measureState === 'active' && measureGroup.children.length > 0) {
+    toNDC(e);
+    raycaster.setFromCamera(mouse, camera);
+    const hit = raycaster.intersectObjects(measureGroup.children, false)[0];
+    if (hit) {
+      draggingMarker = hit.object;
+      draggingMarker.userData.outline.visible = true;
+      controls.enabled = false; // suppress OrbitControls pan while dragging
+      canvas.style.cursor = 'grabbing';
+      canvas.setPointerCapture(e.pointerId);
+    }
+  }
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!draggingMarker) return;
+  if (terrainMeshes.length === 0) return;
+  toNDC(e);
+  raycaster.setFromCamera(mouse, camera);
+  const hit = raycaster.intersectObjects(terrainMeshes)[0];
+  if (!hit) return;
+  draggingMarker.userData.point.copy(hit.point); // mutates the measurePoints entry too
+  finishMeasure(); // live bbox / readout / highlight update (animate re-applies float/spin)
+});
+
+function endMarkerDrag(e) {
+  if (!draggingMarker) return;
+  draggingMarker = null;
+  controls.enabled = true;
+  canvas.style.cursor = '';
+  if (e) { try { canvas.releasePointerCapture(e.pointerId); } catch { /* already lost */ } }
+}
+canvas.addEventListener('pointerup', endMarkerDrag);
+canvas.addEventListener('pointercancel', endMarkerDrag);
+
+canvas.addEventListener('click', (e) => {
+  if (measureState !== 'first' && measureState !== 'second') return;
+  if (Math.hypot(e.clientX - measureDownX, e.clientY - measureDownY) > 5) return;
+  if (terrainMeshes.length === 0) return;
+  toNDC(e);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(terrainMeshes);
+  if (hits.length === 0) return;
+
+  const pt = hits[0].point.clone();
+  measurePoints.push(pt);
+  const marker = makeMarker(pt);
+  marker.userData.point = pt; // same Vector3 as in measurePoints — drag mutates both
+  measureGroup.add(marker);
+
+  if (measureState === 'first') {
+    measureState = 'second';
+    setMeasureReadout('Click the terrain to set point 2 of 2');
+  } else {
+    measureState = 'active';
+    finishMeasure();
+  }
 });
 
 // ── Operation hint autohide ──────────────────────────────────────────────────────
@@ -2038,6 +2292,24 @@ let lastFrameTime = 0;
     updateBuildings();
     updateRivers();
     updateRegionLabels(); // CSS transition smooths the fade between these coarse ticks
+  }
+
+  // Measure markers: constant on-screen size (~6% of viewport height), a slow spin, and a
+  // gentle float above the anchor. Anchor (userData.point) stays the measured ground truth;
+  // the visual bob/spin never touches the bbox. Float magnitude scales with marker size.
+  if (measureGroup.children.length > 0) {
+    const k = 2 * Math.tan((camera.fov * Math.PI / 180) / 2) * 0.06;
+    const children = measureGroup.children;
+    for (let i = 0; i < children.length; i++) {
+      const m = children[i];
+      const base = m.userData.point;
+      // ~constant screen size, but never smaller than 50 m tall up close (unit height = 1 → s = metres).
+      const s = Math.max(camera.position.distanceTo(base) * k, 50);
+      m.scale.setScalar(s);
+      m.rotation.y = t * 0.0006; // slow spin
+      const bob = Math.sin(t * 0.002 + i * Math.PI) * 0.2 * s; // out-of-phase float per marker
+      m.position.set(base.x, base.y + 0.45 * s + bob, base.z);
+    }
   }
 
   renderer.render(scene, camera);
