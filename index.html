@@ -4,14 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗻</text></svg>">
-  <title>DTM Visualizer &mdash; Taipei</title>
+  <title>Formosa's Edge &mdash; Taiwan 3D Terrain</title>
   <script type="module" src="/src/main.js"></script>
 </head>
 <body>
   <!-- Top bar -->
   <header id="top-bar">
-    <span id="app-title">DTM Visualizer &mdash; Taipei</span>
-    <button id="panel-toggle" type="button" aria-label="Toggle control panel" aria-expanded="true">☰</button>
+    <span id="app-title">Formosa's Edge</span>
+    <div class="top-actions">
+      <button id="debug-toggle" type="button" aria-label="Toggle performance overlay" aria-pressed="false">&#128030;</button>
+      <button id="open-math" type="button" aria-label="Explain the math" aria-haspopup="dialog">&#128161;</button>
+    </div>
   </header>
 
   <!-- Full-screen canvas (rendered below all overlays) -->
@@ -25,7 +28,6 @@
       <div class="btn-row">
         <button id="reset-camera" type="button" title="R">Reset</button>
         <button id="top-view"    type="button" title="T">Top</button>
-        <button id="side-view"   type="button">Side</button>
       </div>
     </section>
 
@@ -35,42 +37,25 @@
         <span>Z-Scale <b id="z-scale-value">1.0&times;</b></span>
         <input id="z-scale" type="range" min="0.5" max="5" step="0.1" value="1" />
       </label>
+      <label class="select-label">
+        Color Map
+        <select id="color-map" autocomplete="off">
+          <option value="edge" selected>Edge</option>
+          <option value="terrain">Terrain</option>
+          <option value="grayscale">Grayscale</option>
+          <option value="rainbow">Rainbow</option>
+          <option value="slope">Slope Angle</option>
+          <option value="aspect">Aspect</option>
+        </select>
+      </label>
       <label class="check-label">
         <input id="wireframe-toggle" type="checkbox" />
         Wireframe
       </label>
-      <label class="check-label">
-        <input id="grid-toggle" type="checkbox" />
-        TWD97 Grid
-      </label>
-      <label class="select-label" id="grid-spacing-row" hidden>
-        Spacing
-        <select id="grid-spacing">
-          <option value="1000">1 km</option>
-          <option value="2000">2 km</option>
-          <option value="5000" selected>5 km</option>
-          <option value="10000">10 km</option>
-        </select>
-      </label>
-      <label class="check-label">
-        <input id="boundaries-toggle" type="checkbox" />
-        Admin Boundaries
-      </label>
-      <div class="lod-row">
+      <div class="lod-row" hidden>
         Resolution
         <span id="lod-badge" data-loading="0">100 m</span>
       </div>
-    </section>
-
-    <section class="panel-section">
-      <h3 class="section-title">Color Map</h3>
-      <select id="color-map">
-        <option value="terrain">Terrain</option>
-        <option value="grayscale">Grayscale</option>
-        <option value="rainbow">Rainbow</option>
-        <option value="slope">Slope Angle</option>
-        <option value="aspect">Aspect</option>
-      </select>
     </section>
 
     <section class="panel-section">
@@ -86,7 +71,7 @@
           Highway
         </label>
         <label class="check-label">
-          <span class="road-dot" style="background:#88bbff;"></span>
+          <span class="road-dot" style="background:#ffcc00;"></span>
           <input id="roads-expressway" type="checkbox" checked />
           Expressway
         </label>
@@ -97,12 +82,48 @@
         </label>
       </div>
       <label class="check-label">
-        <input id="hillshade-toggle" type="checkbox" />
-        Hillshade
+        <input id="rivers-toggle" type="checkbox" checked />
+        Rivers
+      </label>
+      <label class="check-label">
+        <input id="buildings-toggle" type="checkbox" checked />
+        Buildings
+      </label>
+      <label class="check-label">
+        <input id="boundaries-toggle" type="checkbox" />
+        Admin Boundaries
+      </label>
+      <label class="check-label">
+        <input id="grid-toggle" type="checkbox" />
+        TWD97 Grid
+      </label>
+      <label class="select-label" id="grid-spacing-row" hidden>
+        Spacing
+        <select id="grid-spacing">
+          <option value="1000">1 km</option>
+          <option value="2000">2 km</option>
+          <option value="5000" selected>5 km</option>
+          <option value="10000">10 km</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="panel-section">
+      <h3 class="section-title">Lighting</h3>
+      <label class="slider-label">
+        <span>Time of Day <b id="time-value">12:00</b></span>
+        <input id="time-of-day" type="range" min="5" max="19" step="0.25" value="12" />
+      </label>
+      <label class="check-label">
+        <input id="shader-toggle" type="checkbox" checked />
+        Shader
       </label>
     </section>
 
   </aside>
+
+  <!-- Panel pull-tab: protrudes from the panel's left edge; collapses it off-screen -->
+  <button id="panel-toggle" type="button" aria-label="Toggle control panel" aria-expanded="true">‹</button>
 
   <!-- Bottom bar: coordinates | legend | operation hint -->
   <footer id="bottom-bar">
@@ -113,7 +134,7 @@
       <span id="legend-max" class="legend-label">&mdash; m</span>
     </div>
     <div id="operation-hint" class="hud-cell hint-cell">
-      Left-drag Orbit &nbsp;|&nbsp; Scroll Zoom &nbsp;|&nbsp; WASD Pan &nbsp;|&nbsp; QE Up/Down
+      Left-drag Pan &nbsp;|&nbsp; Mid-drag Rotate &nbsp;|&nbsp; Scroll Zoom &nbsp;|&nbsp; WASD Pan &nbsp;|&nbsp; QE Up/Down
     </div>
   </footer>
 
@@ -139,9 +160,5 @@
       <div id="math-content" class="modal-body"></div>
     </div>
   </div>
-
-  <!-- Fixed 💡 button -->
-  <button id="open-math" class="fab" type="button"
-    aria-label="Explain the math" aria-haspopup="dialog">&#128161;</button>
 </body>
 </html>

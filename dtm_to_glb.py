@@ -45,8 +45,13 @@ def parse_hdr(path: Path) -> dict:
 
 
 def load_tiles(data_dir: Path) -> tuple[np.ndarray, float]:
-    """Load all GRD tiles; return (N×3 float64 array of X,Y,Z), grid spacing."""
-    hdr_files = sorted(data_dir.glob('*.hdr'))
+    """Load all GRD tiles; return (N×3 float64 array of X,Y,Z), grid spacing.
+
+    Searches recursively (rglob), so a parent dir holding many per-county
+    subdirs (e.g. raw/ with raw/taipei, raw/taichung, …) merges every county's
+    tiles into one point cloud — and thus one shared-centre mesh.
+    """
+    hdr_files = sorted(data_dir.rglob('*.hdr'))
     if not hdr_files:
         raise FileNotFoundError(f'No .hdr files in {data_dir}')
 
@@ -176,6 +181,45 @@ def build_faces(Z: np.ndarray) -> np.ndarray:
     return np.concatenate([tri1, tri2], axis=0).astype(np.uint32)
 
 
+def add_skirts(positions: np.ndarray, norms: np.ndarray, faces: np.ndarray,
+               depth: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Add vertical skirts along the mesh boundary to hide LOD-boundary cracks.
+
+    Boundary edges (used by exactly one triangle) get a lowered duplicate vertex;
+    each boundary edge becomes a quad (emitted in both windings so the curtain is
+    visible from either side under a FrontSide material). Returns extended arrays.
+    """
+    if depth <= 0 or len(faces) == 0:
+        return positions, norms, faces
+
+    edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0)
+    ekey = np.sort(edges, axis=1)
+    uniq, counts = np.unique(ekey, axis=0, return_counts=True)
+    bedges = uniq[counts == 1]
+    if len(bedges) == 0:
+        return positions, norms, faces
+
+    bverts = np.unique(bedges)
+    base = len(positions)
+    remap = np.full(base, -1, dtype=np.int64)
+    remap[bverts] = np.arange(len(bverts)) + base
+
+    skirt_pos = positions[bverts].copy()
+    skirt_pos[:, 1] -= depth
+    skirt_nor = norms[bverts].copy()
+    positions = np.concatenate([positions, skirt_pos])
+    norms = np.concatenate([norms, skirt_nor])
+
+    a, b = bedges[:, 0], bedges[:, 1]
+    a2, b2 = remap[a], remap[b]
+    quads = np.concatenate([
+        np.stack([a, b, b2], axis=1), np.stack([a, b2, a2], axis=1),   # one winding
+        np.stack([a, b2, b], axis=1), np.stack([a, a2, b2], axis=1),   # reverse winding
+    ], axis=0)
+    faces = np.concatenate([faces, quads]).astype(np.uint32)
+    return positions, norms, faces
+
+
 def write_glb(
     x_grid: np.ndarray,
     y_grid: np.ndarray,
@@ -186,6 +230,7 @@ def write_glb(
     y_center: float,
     z_scale: float,
     output_path: Path,
+    skirt: float = 0.0,
 ) -> None:
     """Serialize mesh to GLB (glTF 2.0 binary) format.
 
@@ -206,6 +251,21 @@ def write_glb(
     ], axis=-1).reshape(-1, 3)  # (N, 3)
 
     norms = normals.reshape(-1, 3).astype(np.float32)
+
+    # Compact: drop vertices no face references (every no-data/sea grid cell adds
+    # an unused z=0 vertex — ~half the grid for an island). Remap face indices.
+    used = np.unique(faces)
+    if len(used) < len(positions):
+        remap = np.full(len(positions), -1, dtype=np.int64)
+        remap[used] = np.arange(len(used), dtype=np.int64)
+        positions = positions[used]
+        norms = norms[used]
+        faces = remap[faces].astype(np.uint32)
+        print(f'Compacted vertices: {len(used):,} kept '
+              f'({100 * len(used) / (rows * cols):.1f}% of grid)')
+
+    if skirt > 0:
+        positions, norms, faces = add_skirts(positions, norms, faces, skirt)
 
     v_count = len(positions)
     i_count = faces.size

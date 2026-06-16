@@ -20,6 +20,9 @@ from pathlib import Path
 
 import shapefile
 from pyproj import Transformer
+from shapely.geometry import LineString
+
+from buildings_to_glb import TerrainSampler
 
 
 def read_glb_meta(glb_path: Path) -> dict:
@@ -31,7 +34,10 @@ def read_glb_meta(glb_path: Path) -> dict:
         data = json.loads(f.read(json_len))
 
     extras = data.get('extras', {})
-    acc    = data['accessors'][0]  # POSITION accessor always first
+    # Resolve POSITION via the primitive — Draco compression reorders accessors, so
+    # index 0 is not necessarily POSITION. POSITION always carries min/max (glTF spec).
+    pos_idx = data['meshes'][0]['primitives'][0]['attributes']['POSITION']
+    acc     = data['accessors'][pos_idx]
 
     return {
         'x_center': float(extras.get('x_center', 0)),
@@ -56,6 +62,20 @@ def main() -> None:
         '--margin', type=float, default=2000,
         metavar='M', help='Extra metres around terrain bbox to include (default 2000)',
     )
+    parser.add_argument(
+        '--simplify', type=float, default=1.0, metavar='M',
+        help='Douglas-Peucker tolerance in metres (0 = off); coords also rounded to 1 m',
+    )
+    parser.add_argument(
+        '--dtm', type=Path, default=None,
+        help='DTM raw/ dir to bake per-vertex terrain height into the rings (3D output, '
+             'so the viewer drapes boundaries on the terrain instead of a floating plane)',
+    )
+    parser.add_argument(
+        '--dtm-step', type=int, default=2, metavar='N',
+        help='DTM decimation for the height sampler (2 = 40 m). Boundaries are smooth, so '
+             'a coarse sampler is plenty (default 2)',
+    )
     args = parser.parse_args()
 
     # ── Read GLB metadata ───────────────────────────────────────────────────────
@@ -72,6 +92,12 @@ def main() -> None:
     N_max = -meta['glb_zmin'] + yc + args.margin
     print(f'  Terrain TWD97 extent: E[{E_min:.0f}, {E_max:.0f}]  N[{N_min:.0f}, {N_max:.0f}]')
     print(f'  Origin centroid: x_center={xc:.1f}  y_center={yc:.1f}')
+
+    # ── Terrain height sampler (optional, for draped 3D rings) ───────────────────
+    sampler = None
+    if args.dtm:
+        print(f'Building terrain sampler (step {args.dtm_step}) from {args.dtm}…')
+        sampler = TerrainSampler(args.dtm, step=args.dtm_step)
 
     # ── Coordinate transformer ──────────────────────────────────────────────────
     # GCS_TWD97[2020] (lon/lat, degrees) → EPSG:3826 (TM2 metres)
@@ -126,10 +152,23 @@ def main() -> None:
                 continue
 
             # Convert to Three.js local space (same transform as GLB vertices)
-            ring = [
-                [round(float(e - xc), 1), round(float(-(n - yc)), 1)]
-                for e, n in zip(es, ns)
-            ]
+            local = [(float(e - xc), float(-(n - yc))) for e, n in zip(es, ns)]
+            # Douglas-Peucker (1 m) to drop near-collinear ring vertices
+            if args.simplify > 0:
+                local = list(LineString(local).simplify(args.simplify, preserve_topology=True).coords)
+                if len(local) < 3:
+                    skipped += 1
+                    continue
+            # round() → 1 m integers (no ".x" decimals → smaller JSON). With --dtm, bake
+            # Y = terrain elevation per vertex so the viewer drapes the ring on the terrain
+            # (E = x + xc, N = yc − z inverts the local-space mapping above to sample the DTM).
+            if sampler:
+                ring = []
+                for x, z in local:
+                    h = sampler.height(x + xc, yc - z)
+                    ring.append([round(x), round(h if h is not None else sampler._fallback), round(z)])
+            else:
+                ring = [[round(x), round(z)] for x, z in local]
             rings.append(ring)
             names.append(name)
 
