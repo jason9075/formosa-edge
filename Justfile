@@ -87,8 +87,9 @@ stage-draco:
     @echo "Draco decoder staged to public/draco/"
 
 # Extract road centrelines from shapefile → output/roads.json (clipped to terrain extent)
+# --dtm bakes per-vertex terrain height (40 m sampler) so the viewer never re-clamps roads.
 convert-roads:
-    python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taiwan_100m.glb output/roads.json
+    python3 road_to_json.py "raw/road/ROAD_國省道(含快速公路)_1150409.shp" output/taiwan_100m.glb output/roads.json --dtm {{data_dir}} --dtm-step 2
 
 # Extract township boundary rings from shapefile → output/boundaries.json
 # --simplify 5: 5 m Douglas-Peucker (imperceptible from altitude, ~halves the file)

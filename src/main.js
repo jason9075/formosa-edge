@@ -774,7 +774,6 @@ function disposeTile(map, group, key) {
   group.remove(m);
   m.geometry.dispose();
   map.delete(key);
-  if (map === detailTiles && detailTileGrids.delete(key)) scheduleRoadRebake();
 }
 
 /**
@@ -807,13 +806,6 @@ function loadTile(tile, level) {
       if (isDetail && baseTiles.has(tile.key)) disposeTile(baseTiles, baseTileGroup, tile.key);
       group.add(m);
       map.set(tile.key, m);
-      // Build per-tile 20 m height grid + schedule road rebake ONLY when roads are
-      // live — otherwise this fires on every tile during low flight for hidden roads
-      // (the terrain-only stutter). Backfilled when roads are toggled on.
-      if (isDetail && roadsActive()) {
-        detailTileGrids.set(tile.key, buildDetailTileGrid(mesh.geometry));
-        scheduleRoadRebake();
-      }
       setDetailBadge();
     },
     undefined,
@@ -1231,132 +1223,6 @@ function applyTheme(map) {
   }
 }
 
-// ── Terrain height grid (for road elevation lookup) ──────────────────────────────
-/** @type {Map<string, number>|null} built once from first terrain load */
-let terrainHeightGrid = null;
-const HEIGHT_SNAP  = 100; // metres — coarsest (100 m) GLB grid
-const DETAIL_SNAP  = 20;  // metres — 20 m tile grid resolution
-
-// Per-tile mini height-maps built as 20 m tiles load; keyed by tile key.
-/** @type {Map<string, Map<string, number>>} */
-const detailTileGrids = new Map();
-
-// Spatial index: `${gridI},${gridJ}` → tile key. Built when tileIndex loads.
-// Grid indices are relative to the minimum tile center to avoid floating-point
-// misalignment when centers are not at exact multiples of tileSize.
-/** @type {Map<string, string>|null} */
-let tileSpatialIndex  = null;
-let tileSpatialSnap   = 5000; // tileSize from index.json
-let tileSpatialOrigin = { x: 0, z: 0 }; // minimum (cx, cz)
-
-/** Debounce handle for re-baking road elevations after detail tiles change. */
-let roadRebakeTimer = null;
-function scheduleRoadRebake() {
-  clearTimeout(roadRebakeTimer);
-  roadRebakeTimer = setTimeout(applyRoadElevations, 400);
-}
-
-/** Build the tile spatial index once tileIndex is available. */
-function buildTileSpatialIndex() {
-  tileSpatialSnap = tileIndex.tileSize ?? 5000;
-  // Normalise relative to the minimum centre so that Math.round works correctly
-  // even when tile centres are not at exact multiples of tileSize.
-  let minCx = Infinity, minCz = Infinity;
-  for (const t of tileIndex.tiles) {
-    if (t.cx < minCx) minCx = t.cx;
-    if (t.cz < minCz) minCz = t.cz;
-  }
-  tileSpatialOrigin = { x: minCx, z: minCz };
-  tileSpatialIndex  = new Map();
-  for (const t of tileIndex.tiles) {
-    const gx = Math.round((t.cx - minCx) / tileSpatialSnap);
-    const gz = Math.round((t.cz - minCz) / tileSpatialSnap);
-    tileSpatialIndex.set(`${gx},${gz}`, t.key);
-  }
-}
-
-/**
- * Build a 20 m resolution height-map for one detail tile geometry.
- * @param {THREE.BufferGeometry} geometry
- * @returns {Map<string, number>}
- */
-function buildDetailTileGrid(geometry) {
-  const grid = new Map();
-  const pos  = geometry.attributes.position;
-  for (let i = 0; i < pos.count; i++) {
-    const gx  = Math.round(pos.getX(i) / DETAIL_SNAP);
-    const gz  = Math.round(pos.getZ(i) / DETAIL_SNAP);
-    const key = `${gx},${gz}`;
-    const y   = pos.getY(i);
-    const cur = grid.get(key);
-    if (cur === undefined || y > cur) grid.set(key, y);
-  }
-  return grid;
-}
-
-function buildTerrainHeightGrid() {
-  terrainHeightGrid = new Map();
-  terrainGroup.traverse((obj) => {
-    if (!obj.isMesh) return;
-    const pos = obj.geometry.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const gx = Math.round(pos.getX(i) / HEIGHT_SNAP);
-      const gz = Math.round(pos.getZ(i) / HEIGHT_SNAP);
-      const key = `${gx},${gz}`;
-      const y = pos.getY(i);
-      const cur = terrainHeightGrid.get(key);
-      if (cur === undefined || y > cur) terrainHeightGrid.set(key, y);
-    }
-  });
-}
-
-/**
- * Terrain elevation at (x, z) in GLB local space.
- * Prefers 20 m detail tile data when the tile is loaded; falls back to 100 m grid.
- * Takes the max of the 4 surrounding grid corners so roads never sink between samples.
- * @param {number} x @param {number} z @returns {number}
- */
-function sampleTerrainHeight(x, z) {
-  // 20 m detail tile lookup — O(1) via spatial index
-  if (tileSpatialIndex) {
-    const sgx = Math.round((x - tileSpatialOrigin.x) / tileSpatialSnap);
-    const sgz = Math.round((z - tileSpatialOrigin.z) / tileSpatialSnap);
-    const tileKey = tileSpatialIndex.get(`${sgx},${sgz}`);
-    if (tileKey) {
-      const grid = detailTileGrids.get(tileKey);
-      if (grid) {
-        const dgx = x / DETAIL_SNAP;
-        const dgz = z / DETAIL_SNAP;
-        const x0 = Math.floor(dgx), x1 = x0 + 1;
-        const z0 = Math.floor(dgz), z1 = z0 + 1;
-        let maxY;
-        for (const cx of [x0, x1]) {
-          for (const cz of [z0, z1]) {
-            const y = grid.get(`${cx},${cz}`);
-            if (y !== undefined && (maxY === undefined || y > maxY)) maxY = y;
-          }
-        }
-        if (maxY !== undefined) return maxY;
-      }
-    }
-  }
-
-  // 100 m fallback
-  if (!terrainHeightGrid || !terrainBBox) return terrainBBox?.min.y ?? 0;
-  const gx = x / HEIGHT_SNAP;
-  const gz = z / HEIGHT_SNAP;
-  const x0 = Math.floor(gx), x1 = x0 + 1;
-  const z0 = Math.floor(gz), z1 = z0 + 1;
-  let maxY = terrainBBox.min.y;
-  for (const cx of [x0, x1]) {
-    for (const cz of [z0, z1]) {
-      const y = terrainHeightGrid.get(`${cx},${cz}`);
-      if (y !== undefined && y > maxY) maxY = y;
-    }
-  }
-  return maxY;
-}
-
 // ── Road overlay ─────────────────────────────────────────────────────────────────
 /** @type {THREE.Group|null} */
 let roadGroup = null;
@@ -1365,35 +1231,6 @@ const roadLayers = new Map();
 // Roads float ROAD_LIFT world-metres above terrain; scale.y tracks userZScale.
 const ROAD_LIFT = 20;
 
-/**
- * After terrain height grid is ready, bake per-vertex elevation into road buffers.
- * Vertex local-Y = raw terrain elevation; roadGroup.scale.y = userZScale
- * → world_Y = ROAD_LIFT + userZScale × elevation, matching the terrain transform.
- */
-/**
- * Roads incur streaming cost (per-tile height grid + full road-geometry rebake) only
- * when loaded AND visible. Gating on this keeps terrain-only low-altitude flight smooth:
- * roads default off, yet the geometry is eagerly loaded, so `roadLayers.size` alone never
- * skips the work — the visibility check does.
- */
-function roadsActive() {
-  return roadGroup != null && roadsToggle.checked;
-}
-
-function applyRoadElevations() {
-  if (!terrainHeightGrid || roadLayers.size === 0 || !roadsActive()) return;
-  for (const [, line] of roadLayers) {
-    const { flat, positions } = line.userData;
-    const edgeCount = flat.length / 4;
-    for (let i = 0; i < edgeCount; i++) {
-      const fi = i * 4, pi = i * 6;
-      positions[pi + 1] = sampleTerrainHeight(flat[fi], flat[fi + 1]);
-      positions[pi + 4] = sampleTerrainHeight(flat[fi + 2], flat[fi + 3]);
-    }
-    line.geometry.setPositions(positions); // rebuilds the instanced segment attributes
-  }
-}
-
 function updateRoadY() {
   if (!roadGroup) return;
   roadGroup.position.y = ROAD_LIFT;
@@ -1401,9 +1238,11 @@ function updateRoadY() {
 }
 
 /**
- * Build a THREE.Group with one LineSegments per road class.
- * Input arrays are flat XZ edge pairs: [x0,z0, x1,z1, ...] with Y=0.
- * @param {{ highway: number[], expressway: number[], provincial: number[] }} data
+ * Build a THREE.Group with one fat-line mesh per road class.
+ * roads.json stores 3D polyline strips per class ([[x,y,z,x,y,z,...], ...]) with Y baked
+ * offline against the terrain (road_to_json.py --dtm), so there is no runtime height
+ * sampling or re-clamping; Z-Scale still scales Y live via roadGroup.scale.y.
+ * @param {{ highway: number[][], expressway: number[][], provincial: number[][] }} data
  * @returns {THREE.Group}
  */
 function buildRoadGroup(data) {
@@ -1415,31 +1254,20 @@ function buildRoadGroup(data) {
     { key: 'provincial', color: 0x66ccaa, width: 3.0, opacity: 0.90 },
   ];
   for (const { key, color, width, opacity } of classes) {
-    // roads.json stores polyline strips per class ([[x,z,x,z,...], ...]); expand each
-    // strip into LineSegments edge pairs and merge the class into one geometry.
     const strips = data[key];
     if (!strips || strips.length === 0) continue;
-    const flat = [];
+    // Expand each [x,y,z,...] strip into LineSegments edge pairs (6 numbers/edge).
+    const positions = [];
     for (const s of strips) {
-      for (let i = 0; i + 3 < s.length; i += 2) {
-        flat.push(s[i], s[i + 1], s[i + 2], s[i + 3]);
+      for (let i = 0; i + 5 < s.length; i += 3) {
+        positions.push(s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5]);
       }
     }
-    if (flat.length < 4) continue;
-    const edgeCount = flat.length / 4;
-    const positions = new Float32Array(edgeCount * 6);
-    for (let i = 0; i < edgeCount; i++) {
-      const fi = i * 4, pi = i * 6;
-      const x0 = flat[fi], z0 = flat[fi+1], x1 = flat[fi+2], z1 = flat[fi+3];
-      positions[pi]   = x0; positions[pi+1] = sampleTerrainHeight(x0, z0); positions[pi+2] = z0;
-      positions[pi+3] = x1; positions[pi+4] = sampleTerrainHeight(x1, z1); positions[pi+5] = z1;
-    }
+    if (positions.length < 6) continue;
     const geom = new LineSegmentsGeometry();
     geom.setPositions(positions);
     const line = new LineSegments2(geom, makeFatLineMaterial(color, width, opacity));
-    line.frustumCulled = false; // dynamic Y + island-wide bounds; cheap, avoids mis-cull
-    line.userData.flat = flat;            // raw XZ edge pairs, for elevation rebake
-    line.userData.positions = positions;  // reused buffer for setPositions on rebake
+    line.frustumCulled = false; // island-wide bounds; cheap, avoids mis-cull
     roadLayers.set(key, line);
     group.add(line);
   }
@@ -1459,14 +1287,6 @@ fetch(BASE + 'roads.json')
 roadsToggle.addEventListener('change', () => {
   if (roadGroup) roadGroup.visible = roadsToggle.checked;
   roadsSub.hidden = !roadsToggle.checked;
-  if (roadsToggle.checked) {
-    // Grids/rebake were skipped while roads were hidden — backfill resident detail
-    // tiles, then bake road Y once against the now-available 20 m grids.
-    for (const [key, m] of detailTiles) {
-      if (!detailTileGrids.has(key)) detailTileGrids.set(key, buildDetailTileGrid(m.geometry));
-    }
-    applyRoadElevations();
-  }
 });
 /** @param {string} key @param {boolean} v */
 function setRoadLayerVisible(key, v) {
@@ -1665,7 +1485,6 @@ loader.setDRACOLoader(dracoLoader);
       const fullGeom = firstMesh.geometry;
       lodCache.set(GLB_URL, fullGeom);
       buildTerrainGroup(fullGeom);
-      buildTerrainHeightGrid(); // build once from 100m terrain; roads use this for vertex Y
       applyVertexColors(terrainMeshes, currentColorMap);
       lodGroupCache.set(GLB_URL, {
         group:    terrainGroup,
@@ -1676,7 +1495,6 @@ loader.setDRACOLoader(dracoLoader);
       if (userZScale !== 1) terrainGroup.scale.y = userZScale;
 
       scene.add(terrainGroup);
-      applyRoadElevations(); // fix vertex Y if roads loaded before terrain
       updateRoadY();
       updateBoundaryY();
       activeLodUrl = GLB_URL;
@@ -1696,7 +1514,7 @@ loader.setDRACOLoader(dracoLoader);
       scene.add(baseTileGroup);
       fetch(import.meta.env.BASE_URL + 'tiles/index.json')
         .then((r) => (r.ok ? r.json() : null))
-        .then((d) => { if (d && d.tiles) { tileIndex = d; buildTileSpatialIndex(); } })
+        .then((d) => { if (d && d.tiles) tileIndex = d; })
         .catch(() => { console.info('[tiles] tiles/index.json not found — run: just tile'); });
 
       // Building tiles: white massing + box LOD, streamed by updateBuildings().
