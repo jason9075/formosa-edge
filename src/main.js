@@ -8,6 +8,7 @@ import { LineSegments2 }        from 'three/examples/jsm/lines/LineSegments2.js'
 import { LineGeometry }         from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 import { LineMaterial }         from 'three/examples/jsm/lines/LineMaterial.js';
+import { RGBELoader }          from 'three/examples/jsm/loaders/RGBELoader.js';
 import renderMathInElement from 'katex/dist/contrib/auto-render';
 import createStats from './stats.js';
 import 'katex/dist/katex.min.css';
@@ -64,6 +65,21 @@ const langToggle      = document.getElementById('language-toggle');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true, stencil: true });
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+// ── HDR skybox ───────────────────────────────────────────────────────────────
+// Loaded once; applied as scene.background in Edge theme via applyTheme.
+// Kept as equirectangular mapping (not PMREM) — we only want it as a backdrop,
+// not as IBL, so the existing dirLight + hemisphere keep full control of shading.
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+/** @type {THREE.Texture|null} */
+let hdrBackground = null;
+new RGBELoader().load('/env/sky_1k.hdr', (tex) => {
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  hdrBackground = tex;
+  pmrem.dispose();
+  if (currentColorMap === 'edge') scene.background = hdrBackground;
+});
 
 // Draggable debug HUD (MS / MB / three.js render-info). Hidden until the Debug button.
 const stats = createStats();
@@ -136,17 +152,56 @@ const hemi = new THREE.HemisphereLight(0xeaf2ff, 0x6f8fb5, 0.9);
 scene.add(dirLight);
 scene.add(hemi);
 
-// Sea: a large horizontal plane at sea level (y≈0), the same blue as the rivers.
-// The DTM drops sea/no-data vertices, so without this the ocean reads as the sky
-// background; this plane gives a distinct water surface that fogs into the horizon.
-// Sits just below 0 so coastal land covers its edge. Only shown in the Edge theme.
-const seaMat = new THREE.MeshBasicMaterial({ color: 0x4a90d9, fog: true, side: THREE.DoubleSide });
-const seaPlane = new THREE.Mesh(new THREE.PlaneGeometry(2_000_000, 2_000_000), seaMat);
-seaPlane.rotation.x = -Math.PI / 2; // lay flat in the XZ plane
-seaPlane.position.y = -2;
-seaPlane.renderOrder = -1;          // behind terrain/tiles
-seaPlane.visible = false;           // toggled by applyTheme (Edge only)
-scene.add(seaPlane);
+
+// ── Sun disc + halo sprites (Edge theme only) ────────────────────────────────
+// Two-layer sprite stack: tight bright disc + wide soft halo. Both use canvas
+// radial-gradient textures and additive blending so they glow against the sky.
+// Positioned at camera + sunDirWorld * SUN_DIST each frame → tracks the camera
+// like a skydome element. Hidden when below the horizon or outside Edge theme.
+/**
+ * @param {string} inner  CSS color for gradient center stop
+ * @param {string} outer  CSS color for gradient edge stop
+ * @returns {THREE.CanvasTexture}
+ */
+function makeSunTex(inner, outer) {
+  const sz = 256;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = sz;
+  const ctx = cv.getContext('2d');
+  const h = sz / 2;
+  const g = ctx.createRadialGradient(h, h, 0, h, h, h);
+  g.addColorStop(0,    inner);
+  g.addColorStop(0.18, inner);
+  g.addColorStop(0.42, outer);
+  g.addColorStop(1,    'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, sz, sz);
+  return new THREE.CanvasTexture(cv);
+}
+
+const SUN_DIST = 500000; // world metres — beyond all terrain
+
+const sunDiscMat = new THREE.SpriteMaterial({
+  map: makeSunTex('rgba(255,255,220,1)', 'rgba(255,200,80,0.55)'),
+  transparent: true,
+  depthWrite:  false,
+  blending:    THREE.AdditiveBlending,
+});
+const sunDisc = new THREE.Sprite(sunDiscMat);
+sunDisc.scale.setScalar(16000);
+sunDisc.visible = false;
+scene.add(sunDisc);
+
+const sunHaloMat = new THREE.SpriteMaterial({
+  map: makeSunTex('rgba(255,160,50,0.30)', 'rgba(255,80,10,0)'),
+  transparent: true,
+  depthWrite:  false,
+  blending:    THREE.AdditiveBlending,
+});
+const sunHalo = new THREE.Sprite(sunHaloMat);
+sunHalo.scale.setScalar(55000);
+sunHalo.visible = false;
+scene.add(sunHalo);
 
 // Shadows: the directional light + its orthographic shadow camera FOLLOW the orbit
 // target each frame, sized to the building view (a few km) — full-island shadow maps
@@ -269,8 +324,9 @@ const gridUniforms = {
 // uSunDirView is recomputed each frame from sunDirWorld via camera.matrixWorldInverse
 // so hillshade stays correct as the camera orbits.
 const sunUniforms = {
-  uHillshade:  { value: 0.0 },
-  uSunDirView: { value: new THREE.Vector3() },
+  uHillshade:   { value: 0.0 },
+  uSunDirView:  { value: new THREE.Vector3() },
+  uShadowColor: { value: new THREE.Vector3(0.25, 0.25, 0.25) }, // neutral until Edge theme
 };
 // World-space sun direction; matches dirLight.position by default (NW sun at 45°)
 let sunDirWorld = new THREE.Vector3(-1, 1.2, -1).normalize();
@@ -456,7 +512,7 @@ function cameraReset() {
   const floorY  = terrainBBox.min.y;
   controls.target.set(taipeiX, floorY, taipeiZ);
   // Due-south (+Z) of target so the view direction is -Z (north up).
-  camera.position.set(taipeiX, floorY + 22000, taipeiZ + 22000);
+  camera.position.set(taipeiX, floorY + 4000, taipeiZ + 8000);
   controls.update();
 }
 
@@ -1245,6 +1301,21 @@ function setSunFromHour(hour) {
   // Edge theme); fog.color is a separate copy, so update both. No effect on other themes.
   SKY_COLOR.copy(SKY_DUSK).lerp(SKY_DAY, day);
   meFog.color.copy(SKY_COLOR);
+
+  // HDR background brightness: noon = full (1.0), horizon = dim (0.10), night = near-black (0.03).
+  // scene.backgroundIntensity only affects the background texture, not geometry lighting.
+  scene.backgroundIntensity = el <= 0 ? 0.03 : (0.10 + 0.90 * day);
+
+  // Sun disc: colour orange at horizon → near-white at noon; halo stronger at dawn/dusk.
+  const edgeActive = scene.fog !== null;
+  const aboveHorizon = el > -0.05; // small margin so disc lingers just as sun sets
+  sunDisc.visible = edgeActive && aboveHorizon;
+  sunHalo.visible = sunDisc.visible;
+  if (sunDisc.visible) {
+    sunDiscMat.color.setRGB(1, 0.68 + 0.32 * day, 0.28 + 0.62 * day);
+    sunHaloMat.color.setRGB(1, 0.48 + 0.30 * day, 0.08 + 0.30 * day);
+    sunHaloMat.opacity = 0.85 - 0.55 * day;  // halo strongest at dawn/dusk
+  }
 }
 
 /**
@@ -1255,15 +1326,22 @@ function setSunFromHour(hour) {
  */
 function applyTheme(map) {
   const me = map === 'edge';
-  scene.background = me ? SKY_COLOR : DARK_BG;
+  // Edge theme: use HDR skybox if loaded, fall back to SKY_COLOR until it arrives.
+  scene.background = me ? (hdrBackground ?? SKY_COLOR) : DARK_BG;
   scene.fog = me ? meFog : null;
-  seaPlane.visible = me;
+  // Re-evaluate sun visibility when theme changes (setSunFromHour checks scene.fog).
+  const sunAbove = sunDirWorld.y > -0.05;
+  sunDisc.visible = me && sunAbove;
+  sunHalo.visible = sunDisc.visible;
   if (me) {
     hemi.color.set(0xeaf2ff);
-    hemi.groundColor.set(0x6f8fb5);
+    hemi.groundColor.set(0x1a2a6c);
+    // Deep indigo-blue shadows for the Edge look (game-style cool shadow tint).
+    sunUniforms.uShadowColor.value.set(0.08, 0.13, 0.38);
   } else {
     hemi.color.set(0x3a4060);      // matches the original uniform dark-blue ambient
     hemi.groundColor.set(0x3a4060);
+    sunUniforms.uShadowColor.value.set(0.25, 0.25, 0.25); // neutral grey floor
   }
 }
 
@@ -1669,6 +1747,7 @@ loader.setDRACOLoader(dracoLoader);
           'uniform vec2  uGridOffset;',
           'uniform float uHillshade;',
           'uniform vec3  uSunDirView;',
+          'uniform vec3  uShadowColor;',
           shader.fragmentShader,
         ].join('\n');
 
@@ -1678,9 +1757,11 @@ loader.setDRACOLoader(dracoLoader);
         shader.fragmentShader = shader.fragmentShader.replace(
           '#include <dithering_fragment>',
           `{
-  // Hillshade: Lambert factor in view space, multiplied over terrain colour
+  // Hillshade: Lambert factor → blend between shadow colour and full brightness.
+  // uShadowColor drives the shadow tone: deep blue in Edge theme, neutral grey otherwise.
   float hs = max(0.0, dot(normal, uSunDirView));
-  gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * max(0.25, hs), uHillshade);
+  vec3 light = uShadowColor + (1.0 - uShadowColor) * hs;
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * light, uHillshade);
 }
 {
   // TWD97 grid overlay
@@ -1923,6 +2004,12 @@ let lastFrameTime = 0;
   dirLight.target.position.copy(controls.target);
   dirLight.position.copy(controls.target).addScaledVector(sunDirWorld, SHADOW_DIST);
 
+  // Sun disc + halo track the camera like a skydome element.
+  if (sunDisc.visible) {
+    sunDisc.position.copy(camera.position).addScaledVector(sunDirWorld, SUN_DIST);
+    sunHalo.position.copy(sunDisc.position);
+  }
+
   // Retune fog by altitude (changing near/far is just uniforms — no material recompile).
   // City scale → tight haze into the white horizon; island overview → pushed away so the
   // whole map stays clear. Only active in the Mirror's Edge theme (scene.fog set).
@@ -1932,12 +2019,6 @@ let lastFrameTime = 0;
     else             { scene.fog.near = 300000; scene.fog.far = 1200000; }
   }
 
-  // Keep the sea just below the LOWEST terrain point (scales with Z-Scale) so it
-  // fills the ocean + no-data gaps without ever flooding low-lying land (the Taipei
-  // basin / river mouths reach ≈ −5 m, which a fixed sea plane would submerge).
-  if (seaPlane.visible && terrainBBox) {
-    seaPlane.position.y = (terrainBBox.min.y - 1) * userZScale;
-  }
 
   controls.update();
 
