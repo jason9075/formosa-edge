@@ -16,7 +16,6 @@
   --top-h:      40px;
   --bottom-h:   48px;
   --panel-w:    260px;
-  --panel-icon: 40px;
 }
 
 body {
@@ -281,23 +280,6 @@ input[type="range"]::-moz-range-thumb {
   gap: 0.3rem;
   color: var(--text-muted);
   font-size: 12px;
-}
-
-.chip {
-  font-size: 0.6rem;
-  background: var(--accent-soft);
-  color: var(--accent);
-  border: 1px solid var(--accent-line);
-  border-radius: 4px;
-  padding: 1px 5px;
-  letter-spacing: 0.04em;
-  vertical-align: middle;
-}
-
-.hint-text {
-  color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
 .roads-sub {
