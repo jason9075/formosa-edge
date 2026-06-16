@@ -32,11 +32,10 @@
           ];
 
           shellHook = ''
-            echo "DTM Visualizer dev shell"
-            echo "  just convert-fast   — generate 40m GLB (quick preview)"
-            echo "  just convert        — generate 20m GLB (full resolution)"
-            echo "  just install        — install npm dependencies"
-            echo "  just dev            — start Three.js frontend on :8080"
+            echo "Formosa's Edge dev shell — see 'just' for all recipes"
+            echo "  Assets : just fetch → convert-100m → tile / buildings / rivers / convert-roads / convert-boundaries"
+            echo "  Deploy : just stage → git add public/ → push main"
+            echo "  Frontend: just dev (http://localhost:8080) · just build"
           '';
         };
       });
