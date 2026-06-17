@@ -107,11 +107,13 @@ stage:
     done || true
     @echo "public/ total: $(du -sh public | cut -f1)"
 
-# Start the Vite dev server on :8080 (serves output/ assets directly — no staging needed)
+# Start the Vite dev server on :8080 (serves output/ assets directly — no staging needed).
+# --host binds all interfaces so a phone on the same LAN can reach it (Vite prints the
+# Network: URL); see the LAN IP echoed below.
 dev:
     @[ -d node_modules ] || npm install --ignore-scripts
-    @echo "\033[36m[dtm-visualizer] Vite dev server → http://localhost:8080\033[0m"
-    node --require ./scripts/fix-noexec.cjs ./node_modules/vite/bin/vite.js --port 8080
+    @echo "\033[36m[dtm-visualizer] Vite dev server → http://localhost:8080  (LAN: http://$(ip route get 1 | awk '{print $7; exit}'):8080)\033[0m"
+    node --require ./scripts/fix-noexec.cjs ./node_modules/vite/bin/vite.js --port 8080 --host
 
 # Production build → dist/
 build:
