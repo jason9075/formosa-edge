@@ -59,14 +59,24 @@ const mathModal       = document.getElementById('math-modal');
 const mathContent     = document.getElementById('math-content');
 const langToggle      = document.getElementById('language-toggle');
 
+// ── Device tier ──────────────────────────────────────────────────────────────────
+// One flag drives every mobile trade-off below: a coarse pointer (touch) means a
+// mobile GPU (Mali/Adreno/PowerVR, often <1 GB) on a battery, so we clamp DPR, drop
+// MSAA, shrink shadow maps + the resident tile working set, fan out fewer fetches, and
+// cap the framerate. logarithmicDepthBuffer stays ON even on mobile: disabling it brings
+// back island-wide z-fighting (near=1 .. far=1e6), a far worse regression than its
+// fillrate cost.
+const IS_MOBILE = matchMedia('(pointer: coarse)').matches;
+const DPR_CAP   = IS_MOBILE ? 1.5 : 2; // devicePixelRatio² is fragment work; phones report 2.5–3.5
+
 // ── Three.js core ────────────────────────────────────────────────────────────────
 // logarithmicDepthBuffer: the camera spans near=1 .. far=1e6 (full island), which
 // wrecks depth precision. stencil: the 100 m base stays visible as a backdrop and is
 // masked (stencil != 1) wherever a tile drew, so gaps while tiles stream show the 100 m
 // surface instead of black — no overlap, no flicker.
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true, stencil: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !IS_MOBILE, logarithmicDepthBuffer: true, stencil: true });
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = IS_MOBILE ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 
 // ── HDR skybox ───────────────────────────────────────────────────────────────
 // Loaded once; applied as scene.background in Edge theme via applyTheme.
@@ -86,12 +96,20 @@ new RGBELoader().load(import.meta.env.BASE_URL + 'env/sky_1k.hdr', (tex) => {
 // Draggable debug HUD (MS / MB / three.js render-info). Hidden until the Debug button.
 const stats = createStats();
 document.body.appendChild(stats.dom);
+// On mobile the top sheet covers the default top-left spot, so default the HUD to the
+// bottom-right corner (above the bottom bar). makeDraggable reads getBoundingClientRect
+// on grab, so a drag still takes over cleanly from this right/bottom anchor.
+if (IS_MOBILE) {
+  Object.assign(stats.dom.style, {
+    top: 'auto', left: 'auto', right: '8px', bottom: 'calc(var(--bottom-h) + 8px)',
+  });
+}
 debugToggleBtn.addEventListener('click', () => {
   stats.setVisible(!stats.visible);
   debugToggleBtn.setAttribute('aria-pressed', String(stats.visible));
   debugToggleBtn.classList.toggle('active', stats.visible);
 });
-renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, DPR_CAP));
 
 // CSS2D overlay for billboarded region-name labels (admin boundaries). Renders crisp
 // DOM text positioned at projected 3D points — layered above the canvas, below the UI
@@ -143,6 +161,68 @@ renderer.domElement.addEventListener('wheel', () => {
   clearTimeout(movingTimer);
   movingTimer = setTimeout(() => { cameraMoving = false; }, 500);
 });
+
+// ── Mobile pan dial (virtual joystick) ────────────────────────────────────────────
+// On-screen circular pad (bottom-left, mobile only) for thumb-panning the camera across
+// the map — touch has no middle-drag PAN. The knob's offset from centre becomes a
+// normalized [-1,1] vector; applyPanDial() turns it into per-frame ground-plane motion,
+// scaled by the camera→target distance so the feel is consistent at every zoom.
+const panDial = document.getElementById('pan-dial');
+const panKnob = document.getElementById('pan-knob');
+const panInput = { x: 0, y: 0 };
+if (panDial && panKnob) {
+  const TRAVEL = 25; // max knob excursion from centre (CSS px), keeps it inside the pad
+  let active = false;
+  const place = (dx, dy) => { panKnob.style.transform = `translate(${dx}px, ${dy}px)`; };
+  const track = (e) => {
+    if (!active) return;
+    const r = panDial.getBoundingClientRect();
+    let dx = e.clientX - (r.left + r.width / 2);
+    let dy = e.clientY - (r.top + r.height / 2);
+    const len = Math.hypot(dx, dy);
+    if (len > TRAVEL) { dx = (dx / len) * TRAVEL; dy = (dy / len) * TRAVEL; }
+    place(dx, dy);
+    panInput.x = dx / TRAVEL;
+    panInput.y = dy / TRAVEL;
+    cameraMoving = true;            // suppress 20 m streaming while actively panning
+    clearTimeout(movingTimer);
+  };
+  const release = (e) => {
+    active = false;
+    panInput.x = panInput.y = 0;
+    panKnob.style.transform = '';   // CSS transition springs it back to centre
+    clearTimeout(movingTimer);
+    movingTimer = setTimeout(() => { cameraMoving = false; }, 300);
+    try { panDial.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+  };
+  panDial.addEventListener('pointerdown', (e) => {
+    active = true;
+    panDial.setPointerCapture(e.pointerId);
+    track(e);
+    e.preventDefault();
+  });
+  panDial.addEventListener('pointermove', track);
+  panDial.addEventListener('pointerup', release);
+  panDial.addEventListener('pointercancel', release);
+}
+
+// Translate camera + orbit target along the ground (XZ) plane per the dial each frame.
+const _panRight = new THREE.Vector3();
+const _panFwd   = new THREE.Vector3();
+const _panDelta = new THREE.Vector3();
+/** @param {number} dt seconds since last frame */
+function applyPanDial(dt) {
+  if (!panInput.x && !panInput.y) return;
+  // Screen-right and screen-forward, flattened onto the ground plane.
+  _panRight.setFromMatrixColumn(camera.matrix, 0); _panRight.y = 0; _panRight.normalize();
+  _panFwd.setFromMatrixColumn(camera.matrix, 2).negate(); _panFwd.y = 0; _panFwd.normalize();
+  const speed = camera.position.distanceTo(controls.target) * 0.8 * dt; // ~80%/s at full deflection
+  _panDelta.set(0, 0, 0)
+    .addScaledVector(_panRight, panInput.x * speed)
+    .addScaledVector(_panFwd, -panInput.y * speed); // dial up (dy<0) → move forward
+  camera.position.add(_panDelta);
+  controls.target.add(_panDelta);
+}
 
 // ── Lighting (sun direction driven by the time-of-day slider; X=East, Y=Up, Z=South) ──
 // Warm-white key sun + a hemisphere fill (cool-white sky, muted blue ground) so lit
@@ -211,7 +291,7 @@ scene.add(sunHalo);
 const SHADOW_R    = 3000;   // half-extent of the shadow frustum (world m)
 const SHADOW_DIST = 12000;  // light distance from target along the sun direction
 dirLight.castShadow = true;
-dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.mapSize.set(IS_MOBILE ? 1024 : 2048, IS_MOBILE ? 1024 : 2048);
 dirLight.shadow.camera.near = 100;
 dirLight.shadow.camera.far  = SHADOW_DIST * 2;
 dirLight.shadow.camera.left   = -SHADOW_R;
@@ -423,12 +503,15 @@ let detailFrameCount = 0;
 // Buffer zone [FAR_ALT_ENTER, FAR_ALT_EXIT] maintains the current state unchanged.
 const FAR_ALT_EXIT  = 22000; // rising above this while in tile mode → switch to monolithic
 const FAR_ALT_ENTER = 18000; // descending below this while in monolithic mode → pre-warm tiles
-const DETAIL_DIST   = 18000; // camera-still: within this of camera → upgrade to 20 m tile
+// Mobile pulls the detail radius in and shrinks the resident caps: mobile GPU memory is
+// often <1 GB, so 160 Draco meshes resident risks the OS killing the tab. Smaller radius
+// also cuts download volume from the ~184 MB detail set on cellular.
+const DETAIL_DIST   = IS_MOBILE ? 9000 : 18000; // camera-still: within this of camera → upgrade to 20 m tile
 const DETAIL_EVICT  = 24000;
 const LOD_HYST      = 4000;  // keep a 20 m tile until this far past DETAIL_DIST (anti-thrash)
-const DETAIL_MAX    = 160;   // resident 20 m cap
-const BASE_MAX      = 320;   // resident 100 m cap
-const MAX_CONCURRENT = 8;
+const DETAIL_MAX    = IS_MOBILE ? 48 : 160;   // resident 20 m cap
+const BASE_MAX      = IS_MOBILE ? 96 : 320;   // resident 100 m cap
+const MAX_CONCURRENT = IS_MOBILE ? 4 : 8; // fewer parallel fetches on cellular/HTTP-1.1
 // true = monolithic hidden, tile mode active. false = monolithic visible (high-alt or pre-warming).
 let tilesModeActive = false;
 let cameraMoving    = false;
@@ -503,14 +586,22 @@ buildingMat.onBeforeCompile = (shader) => {
 buildingMat.customProgramCacheKey = () => 'building-measure-v1';
 
 // ── Panel toggle ─────────────────────────────────────────────────────────────────
+// Mobile lays the panel out as a TOP sheet that hides upward; desktop keeps it on the
+// right, hiding sideways. The toggle glyph follows: ▴/▾ (up=collapse, down=expand) on
+// mobile, ‹/› on desktop.
+const mobilePanelMQ = matchMedia('(max-width: 767px)');
 function setPanelOpen(open) {
   panelOpen = open;
   controlPanel.dataset.open = open ? '1' : '0';
-  panelToggleBtn.textContent = open ? '›' : '‹'; // › collapse (panel slides right) / ‹ expand
+  panelToggleBtn.textContent = mobilePanelMQ.matches
+    ? (open ? '▴' : '▾')   // ▴ collapse (sheet slides up) / ▾ expand (pulls down)
+    : (open ? '›' : '‹');  // › collapse (panel slides right) / ‹ expand
   panelToggleBtn.setAttribute('aria-expanded', String(open));
 }
 setPanelOpen(panelOpen);
 panelToggleBtn.addEventListener('click', () => setPanelOpen(!panelOpen));
+// Refresh the glyph when crossing the breakpoint (orientation change / resize).
+mobilePanelMQ.addEventListener('change', () => setPanelOpen(panelOpen));
 
 // ── Resize ───────────────────────────────────────────────────────────────────────
 // Fat-line (Line2/LineSegments2) materials need the viewport resolution to size
@@ -525,6 +616,8 @@ function makeFatLineMaterial(color, linewidth, opacity) {
 }
 
 function resize() {
+  // Re-clamp: devicePixelRatio can shift on orientation change / browser zoom.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, DPR_CAP));
   renderer.setSize(window.innerWidth, window.innerHeight);
   labelRenderer.setSize(window.innerWidth, window.innerHeight);
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -2166,6 +2259,8 @@ const GIZMO_SIZE = 76;           // CSS px (square)
 const GIZMO_MARGIN = 14;         // CSS px from viewport edge
 // Footer height — keep in sync with CSS --bottom-h so the gizmo sits above the bar.
 const BOTTOM_H = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--bottom-h')) || 48;
+// Header height — used to drop the gizmo just below the top bar in the mobile layout.
+const TOP_H = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--top-h')) || 40;
 const gizmoScene  = new THREE.Scene();
 const gizmoCamera = new THREE.OrthographicCamera(-1.15, 1.15, 1.15, -1.15, 0.1, 100);
 
@@ -2220,10 +2315,17 @@ function renderGizmo() {
   gizmoCamera.position.set(0, 0, 1).applyQuaternion(camera.quaternion).multiplyScalar(3);
   gizmoCamera.updateMatrixWorld();
 
-  const dpr = renderer.getPixelRatio();
-  const x = GIZMO_MARGIN * dpr;
-  const y = (BOTTOM_H + GIZMO_MARGIN) * dpr; // WebGL origin is bottom-left; clear the footer
-  const s = GIZMO_SIZE * dpr;
+  // setViewport/setScissor already multiply by pixelRatio internally, so pass CSS px (no
+  // manual * dpr — doing so double-scaled, which was tolerable in the bottom-left corner
+  // but threw the gizmo off the top edge once moved up).
+  const s = GIZMO_SIZE;
+  const x = GIZMO_MARGIN;
+  // WebGL viewport origin is bottom-left. Mobile layout (top sheet + pan dial): gizmo
+  // top-left, just under the header. Desktop: bottom-left, above the footer. Keyed on the
+  // same 767px breakpoint as the layout so it tracks orientation/resize.
+  const y = mobilePanelMQ.matches
+    ? (window.innerHeight - TOP_H - GIZMO_MARGIN - GIZMO_SIZE)
+    : (BOTTOM_H + GIZMO_MARGIN);
 
   renderer.setScissorTest(true);
   renderer.setScissor(x, y, s, s);
@@ -2239,8 +2341,15 @@ function renderGizmo() {
 // ── Render loop ──────────────────────────────────────────────────────────────────
 let lastFrameTime = 0;
 
+// Mobile: cap to ~30 fps. The scene is mostly static, so the second half of a 60 Hz
+// budget buys little but doubles GPU draw, battery drain, and thermal throttling. rAF
+// stays alive; we just skip the body until enough time has elapsed since the last
+// rendered frame (lastFrameTime is updated below, so the gate measures rendered frames).
+const FRAME_MIN_MS = IS_MOBILE ? 33 : 0;
+
 (function animate(t) {
   requestAnimationFrame(animate);
+  if (FRAME_MIN_MS && t - lastFrameTime < FRAME_MIN_MS) return;
   stats.begin();
 
   const dt = Math.min((t - lastFrameTime) / 1000, 0.05);
@@ -2273,6 +2382,7 @@ let lastFrameTime = 0;
     else             { scene.fog.near = 300000; scene.fog.far = 1200000; }
   }
 
+  applyPanDial(dt); // mobile virtual joystick → ground-plane pan, before controls clamp
 
   controls.update();
 

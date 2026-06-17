@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗻</text></svg>">
   <title>Formosa's Edge &mdash; Taiwan 3D Terrain</title>
   <script type="module" src="/src/main.js"></script>
@@ -126,6 +126,11 @@
 
   <!-- Panel pull-tab: protrudes from the panel's left edge; collapses it off-screen -->
   <button id="panel-toggle" type="button" aria-label="Toggle control panel" aria-expanded="true">‹</button>
+
+  <!-- Mobile-only virtual joystick: thumb-pan the camera across the map (bottom-left) -->
+  <div id="pan-dial" aria-hidden="true">
+    <div id="pan-knob"></div>
+  </div>
 
   <!-- Bottom bar: coordinates | legend | operation hint -->
   <footer id="bottom-bar">
